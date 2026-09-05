@@ -16,3 +16,7 @@
 @media(max-width:1200px){.admin-summary-grid{grid-template-columns:repeat(3,1fr)}}
 @media(max-width:850px){.security-admin-grid{grid-template-columns:1fr}.category-bars>div{grid-template-columns:120px 1fr 36px}.rating-admin-item{display:block}.rating-admin-item>.moderation-actions{justify-content:flex-start;margin-top:12px}.admin-summary-grid{grid-template-columns:repeat(2,1fr)}}
 @media(max-width:550px){.admin-summary-grid{grid-template-columns:1fr}.category-bars>div{grid-template-columns:1fr}.category-bars strong{text-align:left}.admin-section-head{display:block}.admin-section-head button{margin-top:10px}}
+
+/* V7.1 — ações administrativas mais robustas */
+button:disabled{opacity:.58;cursor:wait}.admin-prof-edit{margin-top:14px;border-top:1px solid var(--line);padding-top:10px}.admin-prof-edit summary{color:#344038}.admin-prof-form{padding:10px 0 2px}.admin-prof-form .form-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.outline-danger{background:#fff;color:var(--danger);border:1px solid #e7b4b4}.outline-danger:hover{background:#fff0f0}.doc-actions{display:flex;gap:7px;flex-wrap:wrap;margin:10px 0}.identity-review{align-items:flex-start}.identity-review .moderation-main{flex:1;min-width:0}.identity-review .moderation-actions{max-width:470px}.moderation-item button{white-space:nowrap}
+@media(max-width:900px){.identity-review{display:block}.identity-review .moderation-actions{max-width:none;justify-content:flex-start;margin-top:14px}.admin-prof-form .form-grid{grid-template-columns:1fr}}

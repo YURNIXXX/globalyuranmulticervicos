@@ -1,4 +1,4 @@
-const CACHE='yuran-static-v7';
+const CACHE='yuran-static-v7.1';
 const SHELL=['/','/profissionais','/categorias','/como-funciona','/ajuda','/css/style.css','/css/platform.css','/js/platform-shared.js'];
 self.addEventListener('install',event=>{event.waitUntil(caches.open(CACHE).then(cache=>cache.addAll(SHELL).catch(()=>{})));self.skipWaiting()});
 self.addEventListener('activate',event=>{event.waitUntil(caches.keys().then(keys=>Promise.all(keys.filter(k=>k!==CACHE).map(k=>caches.delete(k)))));self.clients.claim()});

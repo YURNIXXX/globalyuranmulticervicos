@@ -226,6 +226,18 @@ ${PUBLIC_BASE_URL}${link}` : ''}`);
     if (sent) await supabase.from('professional_notifications').update({ email_sent: true }).eq('id', id);
   } catch (e) { console.error('Notificação não registada:', e.message); }
 }
+async function safeAuditLog({ target_type, target_id, action, reason = '', metadata = {} }) {
+  try {
+    const { error } = await supabase.from('moderation_logs').insert({
+      id: crypto.randomUUID(), target_type, target_id, action, reason,
+      metadata, created_at: new Date().toISOString()
+    });
+    if (error) throw error;
+  } catch (e) {
+    // A ação administrativa principal nunca deve falhar só porque o log falhou.
+    console.error('Falha ao registar auditoria:', e.message);
+  }
+}
 async function purgeExpiredIdentityDocuments() {
   if (!USE_SUPABASE) return;
   const now = new Date().toISOString();
@@ -629,6 +641,7 @@ function requireProfessional(req, res, next) {
 }
 function professionalSessionRow(p = {}) {
   const { user_id, id_front_path, id_back_path, pre_suspension_status, ...safe } = p;
+  safe.verified = Boolean(safe.verified && safe.status === 'approved' && safe.verification_status === 'approved');
   return safe;
 }
 function digits(value = '') { return String(value).replace(/\D/g, ''); }
@@ -994,7 +1007,7 @@ app.get('/api/professionals', async (req, res) => {
       const ps = (services || []).filter(s => s.professional_id === p.id).map(({professional_id,...rest})=>rest);
       const rr = (ratings || []).filter(r=>r.professional_id===p.id);
       const avg = rr.length ? rr.reduce((a,x)=>a+Number(x.stars||0),0)/rr.length : 0;
-      return { ...p, identityValidated: p.verification_status === 'approved', verification_status: undefined, services: ps, ratingAvg: avg, ratingCount: rr.length };
+      return { ...p, verified: Boolean(p.verified && p.verification_status === 'approved'), identityValidated: p.verification_status === 'approved', verification_status: undefined, services: ps, ratingAvg: avg, ratingCount: rr.length };
     });
     if (term) result = result.filter(p => [p.name,p.specialty,p.headline,p.location,p.bio,p.service_area,p.skills,...p.services.flatMap(s=>[s.title,s.category,s.service_area])].some(v => String(v||'').toLowerCase().includes(term)));
     if (category) result = result.filter(p => p.services.some(s=>String(s.category||'').toLowerCase()===category || String(s.title||'').toLowerCase().includes(category)) || String(p.specialty||'').toLowerCase().includes(category));
@@ -1022,7 +1035,7 @@ app.get('/api/professionals/:slug', async (req, res) => {
     const avg = ratings?.length ? ratings.reduce((a,x)=>a+Number(x.stars||0),0)/ratings.length : 0;
     const views = new Set((events||[]).filter(x=>x.event_type==='view').map(x=>x.visitor_hash)).size;
     const contacts = new Set((events||[]).filter(x=>x.event_type==='contact').map(x=>x.visitor_hash)).size;
-    const publicProfile = { ...profile, identityValidated: profile.verification_status === 'approved' }; delete publicProfile.verification_status;
+    const publicProfile = { ...profile, verified: Boolean(profile.verified && profile.verification_status === 'approved'), identityValidated: profile.verification_status === 'approved' }; delete publicProfile.verification_status;
     res.json({ profile: publicProfile, services: services || [], projects: projects || [], trust: { views, contacts, memberSince: profile.created_at, identityValidated: publicProfile.identityValidated }, rating: { average: avg, count: ratings?.length || 0, reviews: ratings || [] } });
   } catch (error) { console.error(error); res.status(500).json({ error: 'Erro ao carregar profissional.' }); }
 });
@@ -1118,13 +1131,13 @@ app.patch('/api/admin/moderation/:type/:id', requireAuth, async (req, res) => {
     const update = { status, rejection_reason: status === 'rejected' ? String(req.body.rejection_reason || '').trim() : '', updated_at: new Date().toISOString() };
     if (table === 'professional_profiles' && status !== 'suspended') Object.assign(update, { suspended_until: null, suspension_reason: '', pre_suspension_status: '' });
     const { data, error } = await supabase.from(table).update(update).eq('id', req.params.id).select('*').single(); if (error) throw error;
-    await supabase.from('moderation_logs').insert({ id: crypto.randomUUID(), target_type: req.params.type, target_id: req.params.id, action: status, reason: String(req.body.rejection_reason || ''), metadata: { admin: true }, created_at: new Date().toISOString() });
+    await safeAuditLog({ target_type: req.params.type, target_id: req.params.id, action: status, reason: String(req.body.rejection_reason || ''), metadata: { admin: true } });
     let professionalId = table === 'professional_profiles' ? data.id : data.professional_id;
     const typeLabel = table === 'professional_profiles' ? 'perfil' : table === 'professional_services' ? 'serviço' : 'projeto';
     const message = status === 'approved' ? `O seu ${typeLabel} foi aprovado.` : status === 'rejected' ? `O seu ${typeLabel} foi rejeitado. Motivo: ${String(req.body.rejection_reason || 'Consulte o painel.')}` : status === 'suspended' ? `O seu ${typeLabel} foi suspenso pela administração.` : `O seu ${typeLabel} voltou para análise.`;
     await notifyProfessional(professionalId, 'moderation', `${typeLabel[0].toUpperCase()+typeLabel.slice(1)}: ${status === 'approved' ? 'aprovado' : status === 'rejected' ? 'rejeitado' : status === 'suspended' ? 'suspenso' : 'em análise'}`, message, '/profissional/dashboard');
     res.json(data);
-  } catch (error) { console.error(error); res.status(500).json({ error: 'Erro ao moderar item.' }); }
+  } catch (error) { console.error(error); res.status(500).json({ error: error.message || 'Erro ao moderar item.' }); }
 });
 app.patch('/api/admin/featured/:type/:id', requireAuth, async (req, res) => {
   try {
@@ -1133,7 +1146,7 @@ app.patch('/api/admin/featured/:type/:id', requireAuth, async (req, res) => {
     const featured = Boolean(req.body.featured);
     const { data, error } = await supabase.from(table).update({ featured, updated_at: new Date().toISOString() }).eq('id', req.params.id).eq('status', 'approved').select('*').single();
     if (error) throw error;
-    await supabase.from('moderation_logs').insert({ id: crypto.randomUUID(), target_type: req.params.type, target_id: req.params.id, action: featured ? 'featured_on' : 'featured_off', reason: 'Destaque editorial alterado pela administração.', metadata: { admin: true }, created_at: new Date().toISOString() });
+    await safeAuditLog({ target_type: req.params.type, target_id: req.params.id, action: featured ? 'featured_on' : 'featured_off', reason: 'Destaque editorial alterado pela administração.', metadata: { admin: true } });
     res.json(data);
   } catch (error) { console.error(error); res.status(500).json({ error: 'Erro ao alterar destaque.' }); }
 });
@@ -1154,13 +1167,13 @@ app.patch('/api/admin/professionals/:id/verification', requireAuth, async (req, 
     if (!['approved','rejected','pending'].includes(status)) return res.status(400).json({ error: 'Estado de verificação inválido.' });
     if (status === 'rejected' && !reason) return res.status(400).json({ error: 'Informe o motivo da rejeição.' });
     const now = new Date(), retentionUntil = status !== 'pending' ? new Date(now.getTime() + IDENTITY_RETENTION_DAYS * 86400000).toISOString() : null;
-    const update = { verification_status: status, verification_reason: status === 'rejected' ? reason : '', identity_verified_at: status === 'approved' ? now.toISOString() : null, identity_retention_until: retentionUntil, identity_documents_deleted_at: null, updated_at: now.toISOString() };
+    const update = { verification_status: status, verification_reason: status === 'rejected' ? reason : '', identity_verified_at: status === 'approved' ? now.toISOString() : null, identity_retention_until: retentionUntil, identity_documents_deleted_at: null, updated_at: now.toISOString(), ...(status === 'approved' ? {} : { verified: false }) };
     const { data, error } = await supabase.from('professional_profiles').update(update).eq('id', req.params.id).select('*').single();
     if (error) throw error;
-    await supabase.from('moderation_logs').insert({ id: crypto.randomUUID(), target_type: 'identity', target_id: req.params.id, action: status, reason, metadata: { retention_days: IDENTITY_RETENTION_DAYS }, created_at: new Date().toISOString() });
+    await safeAuditLog({ target_type: 'identity', target_id: req.params.id, action: status, reason, metadata: { retention_days: IDENTITY_RETENTION_DAYS } });
     await notifyProfessional(req.params.id, 'identity', status === 'approved' ? 'Identidade validada' : status === 'rejected' ? 'Documento precisa ser reenviado' : 'Identidade em análise', status === 'approved' ? 'A sua identidade foi validada. Agora complete o perfil e envie os seus serviços e projetos para revisão.' : status === 'rejected' ? `A validação do documento foi recusada. Motivo: ${reason}` : 'Os seus documentos estão em análise.', '/profissional/dashboard');
     res.json(data);
-  } catch (error) { console.error(error); res.status(500).json({ error: 'Erro ao validar identidade.' }); }
+  } catch (error) { console.error(error); res.status(500).json({ error: error.message || 'Erro ao validar identidade.' }); }
 });
 
 app.patch('/api/admin/professionals/:id/verified', requireAuth, async (req, res) => {
@@ -1171,9 +1184,81 @@ app.patch('/api/admin/professionals/:id/verified', requireAuth, async (req, res)
     if (verified && (current.status !== 'approved' || current.verification_status !== 'approved')) return res.status(400).json({ error: 'Aprove o perfil e valide a identidade antes de atribuir o selo verificado.' });
     const { data, error } = await supabase.from('professional_profiles').update({ verified, updated_at: new Date().toISOString() }).eq('id', req.params.id).select('*').single();
     if (error) throw error;
-    await supabase.from('moderation_logs').insert({ id: crypto.randomUUID(), target_type: 'professional', target_id: req.params.id, action: verified ? 'verified_badge_on' : 'verified_badge_off', reason: 'Selo público alterado manualmente pela administração.', created_at: new Date().toISOString() });
+    await safeAuditLog({ target_type: 'professional', target_id: req.params.id, action: verified ? 'verified_badge_on' : 'verified_badge_off', reason: 'Selo público alterado manualmente pela administração.', metadata: { admin: true } });
     res.json(data);
   } catch (error) { console.error(error); res.status(500).json({ error: error.message || 'Erro ao alterar selo verificado.' }); }
+});
+
+// Edição e exclusão direta de profissionais pelo administrador.
+app.put('/api/admin/professionals/:id', requireAuth, async (req, res) => {
+  try {
+    const { data: current, error: ce } = await supabase.from('professional_profiles').select('*').eq('id', req.params.id).maybeSingle();
+    if (ce) throw ce; if (!current) return res.status(404).json({ error: 'Profissional não encontrado.' });
+    const name = String(req.body.name ?? current.name).trim();
+    if (name.length < 3) return res.status(400).json({ error: 'Informe um nome válido.' });
+    const availability = ['available','limited','unavailable'].includes(String(req.body.availability)) ? String(req.body.availability) : (current.availability || 'available');
+    const candidate = {
+      ...current,
+      name,
+      specialty: String(req.body.specialty ?? current.specialty ?? '').trim(),
+      headline: String(req.body.headline ?? current.headline ?? '').trim().slice(0,120),
+      bio: String(req.body.bio ?? current.bio ?? '').trim(),
+      location: String(req.body.location ?? current.location ?? '').trim(),
+      phone: String(req.body.phone ?? current.phone ?? '').trim(),
+      whatsapp: String(req.body.whatsapp ?? current.whatsapp ?? '').trim(),
+      service_area: String(req.body.service_area ?? current.service_area ?? '').trim(),
+      skills: String(req.body.skills ?? current.skills ?? '').trim(),
+      languages: String(req.body.languages ?? current.languages ?? '').trim(),
+      certifications: String(req.body.certifications ?? current.certifications ?? '').trim(),
+      years_experience: Math.max(0, Math.min(80, Number(req.body.years_experience ?? current.years_experience ?? 0) || 0)),
+      availability
+    };
+    const update = {
+      name: candidate.name,
+      slug: candidate.name !== current.name ? await uniqueProfessionalSlug(candidate.name, current.id) : current.slug,
+      specialty: candidate.specialty,
+      headline: candidate.headline,
+      bio: candidate.bio,
+      location: candidate.location,
+      phone: candidate.phone,
+      whatsapp: candidate.whatsapp,
+      service_area: candidate.service_area,
+      skills: candidate.skills,
+      languages: candidate.languages,
+      certifications: candidate.certifications,
+      years_experience: candidate.years_experience,
+      availability: candidate.availability,
+      profile_completeness: profileCompleteness(candidate),
+      updated_at: new Date().toISOString()
+    };
+    const { data, error } = await supabase.from('professional_profiles').update(update).eq('id', current.id).select('*').single();
+    if (error) throw error;
+    await safeAuditLog({ target_type: 'professional', target_id: current.id, action: 'admin_profile_edit', reason: 'Dados do perfil ajustados pela administração.', metadata: { admin: true } });
+    await notifyProfessional(current.id, 'moderation', 'Perfil atualizado pela administração', 'A administração atualizou informações do seu perfil. Consulte a sua área profissional para confirmar os dados.', '/profissional/dashboard');
+    res.json(data);
+  } catch (error) { console.error(error); res.status(500).json({ error: error.message || 'Erro ao editar profissional.' }); }
+});
+
+app.delete('/api/admin/professionals/:id', requireAuth, async (req, res) => {
+  try {
+    const { data: profile, error: pe } = await supabase.from('professional_profiles').select('*').eq('id', req.params.id).maybeSingle();
+    if (pe) throw pe; if (!profile) return res.status(404).json({ error: 'Profissional não encontrado.' });
+    const [{ data: services }, { data: projects }] = await Promise.all([
+      supabase.from('professional_services').select('cover_image').eq('professional_id', profile.id),
+      supabase.from('professional_projects').select('images').eq('professional_id', profile.id)
+    ]);
+    if (profile.id_front_path) await deletePrivateIdentityUpload(profile.id_front_path);
+    if (profile.id_back_path) await deletePrivateIdentityUpload(profile.id_back_path);
+    if (profile.photo) await deleteUpload(profile.photo);
+    if (profile.cv_url) await deleteUpload(profile.cv_url);
+    for (const s of services || []) if (s.cover_image) await deleteUpload(s.cover_image);
+    for (const pr of projects || []) for (const url of pr.images || []) await deleteUpload(url);
+    await safeAuditLog({ target_type: 'professional', target_id: profile.id, action: 'account_deleted', reason: String(req.body?.reason || 'Conta excluída pela administração.'), metadata: { admin: true, email: profile.email, name: profile.name } });
+    const { error } = await supabase.from('professional_users').delete().eq('id', profile.user_id);
+    if (error) throw error;
+    if (req.session.professionalId === profile.id) delete req.session.professionalId;
+    res.json({ ok: true });
+  } catch (error) { console.error(error); res.status(500).json({ error: error.message || 'Erro ao excluir profissional.' }); }
 });
 
 app.get('/api/admin/analytics', requireAuth, async (req, res) => {
@@ -1207,23 +1292,23 @@ app.post('/api/admin/reports/:id/action', requireAuth, async (req, res) => {
       const message = reason || 'A administração recebeu uma denúncia e emitiu uma advertência. Reveja os seus dados e práticas profissionais.';
       await supabase.from('professional_profiles').update({ warning_count: Number(profile.warning_count || 0) + 1, last_warning: message, updated_at: new Date().toISOString() }).eq('id', profile.id);
       await supabase.from('professional_reports').update({ status: 'actioned', admin_action: 'warn', reviewed_at: new Date().toISOString() }).eq('id', report.id);
-      await supabase.from('moderation_logs').insert({ id: crypto.randomUUID(), target_type: 'professional', target_id: profile.id, action: 'warning', reason: message, metadata: { report_id: report.id }, created_at: new Date().toISOString() });
+      await safeAuditLog({ target_type: 'professional', target_id: profile.id, action: 'warning', reason: message, metadata: { report_id: report.id } });
       await notifyProfessional(profile.id, 'warning', 'Advertência da administração', message, '/profissional/dashboard');
     } else if (action === 'suspend') {
       const days = Math.min(365, Math.max(1, Number(req.body.suspensionDays || 7))), until = new Date(Date.now()+days*86400000).toISOString();
       const previous = profile.status === 'suspended' ? (profile.pre_suspension_status || 'pending') : profile.status;
       await supabase.from('professional_profiles').update({ status: 'suspended', pre_suspension_status: previous, suspended_until: until, suspension_reason: reason || `Suspensão temporária por ${days} dia(s).`, updated_at: new Date().toISOString() }).eq('id', profile.id);
       await supabase.from('professional_reports').update({ status: 'actioned', admin_action: `suspend_${days}d`, reviewed_at: new Date().toISOString() }).eq('id', report.id);
-      await supabase.from('moderation_logs').insert({ id: crypto.randomUUID(), target_type: 'professional', target_id: profile.id, action: `suspend_${days}d`, reason: reason || 'Suspensão após denúncia.', metadata: { report_id: report.id, suspended_until: until }, created_at: new Date().toISOString() });
+      await safeAuditLog({ target_type: 'professional', target_id: profile.id, action: `suspend_${days}d`, reason: reason || 'Suspensão após denúncia.', metadata: { report_id: report.id, suspended_until: until } });
       await notifyProfessional(profile.id, 'suspension', 'Conta suspensa temporariamente', reason || `A sua conta foi suspensa por ${days} dia(s).`, '/profissional/dashboard');
     } else if (action === 'dismiss') {
       await supabase.from('professional_reports').update({ status: 'dismissed', admin_action: 'dismiss', reviewed_at: new Date().toISOString() }).eq('id', report.id);
-      await supabase.from('moderation_logs').insert({ id: crypto.randomUUID(), target_type: 'professional', target_id: profile.id, action: 'report_dismissed', reason: reason || 'Denúncia arquivada sem ação disciplinar.', metadata: { report_id: report.id }, created_at: new Date().toISOString() });
+      await safeAuditLog({ target_type: 'professional', target_id: profile.id, action: 'report_dismissed', reason: reason || 'Denúncia arquivada sem ação disciplinar.', metadata: { report_id: report.id } });
     } else if (action === 'delete') {
       if (profile.id_front_path) await deletePrivateIdentityUpload(profile.id_front_path);
       if (profile.id_back_path) await deletePrivateIdentityUpload(profile.id_back_path);
       await supabase.from('professional_reports').update({ status: 'actioned', admin_action: 'delete', reviewed_at: new Date().toISOString() }).eq('id', report.id);
-      await supabase.from('moderation_logs').insert({ id: crypto.randomUUID(), target_type: 'professional', target_id: profile.id, action: 'account_deleted', reason: reason || 'Conta excluída após análise de denúncia.', metadata: { report_id: report.id }, created_at: new Date().toISOString() });
+      await safeAuditLog({ target_type: 'professional', target_id: profile.id, action: 'account_deleted', reason: reason || 'Conta excluída após análise de denúncia.', metadata: { report_id: report.id } });
       await supabase.from('professional_users').delete().eq('id', profile.user_id);
     }
     res.json({ ok: true });
@@ -1289,7 +1374,7 @@ app.get('/api/featured-professionals', async (_, res) => {
     const ids=(profiles||[]).map(x=>x.id);
     let ratings=[];
     if(ids.length){ const rr=await supabase.from('professional_ratings').select('professional_id,stars').in('professional_id',ids).eq('status','published'); if(rr.error)throw rr.error; ratings=rr.data||[]; }
-    res.json((profiles||[]).map(p=>{const r=ratings.filter(x=>x.professional_id===p.id);return {...p,identityValidated:p.verification_status==='approved',verification_status:undefined,ratingAvg:r.length?r.reduce((a,x)=>a+Number(x.stars||0),0)/r.length:0,ratingCount:r.length};}));
+    res.json((profiles||[]).map(p=>{const r=ratings.filter(x=>x.professional_id===p.id);return {...p,verified:Boolean(p.verified&&p.verification_status==='approved'),identityValidated:p.verification_status==='approved',verification_status:undefined,ratingAvg:r.length?r.reduce((a,x)=>a+Number(x.stars||0),0)/r.length:0,ratingCount:r.length};}));
   } catch (error) { console.error(error); res.json([]); }
 });
 
@@ -1305,7 +1390,7 @@ app.get('/api/professionals/:slug/services/:serviceSlug', async (req,res)=>{
     ]);if(re)throw re;if(pre)throw pre;
     await recordProfessionalEvent(req,profile.id,'service_view',{serviceId:service.id,scopeKey:service.id});
     const avg=ratings?.length?ratings.reduce((a,x)=>a+Number(x.stars||0),0)/ratings.length:0;
-    const publicProfile={...profile,identityValidated:profile.verification_status==='approved'};delete publicProfile.verification_status;
+    const publicProfile={...profile,verified:Boolean(profile.verified&&profile.verification_status==='approved'),identityValidated:profile.verification_status==='approved'};delete publicProfile.verification_status;
     res.json({profile:publicProfile,service,projects:projects||[],rating:{average:avg,count:ratings?.length||0,reviews:ratings||[]}});
   }catch(error){console.error(error);res.status(500).json({error:'Erro ao carregar serviço.'});}
 });
@@ -1327,7 +1412,7 @@ app.get('/api/admin/ratings', requireAuth, async(_,res)=>{
   try{const {data,error}=await supabase.from('professional_ratings').select('*,professional_profiles(name,slug),professional_services(title)').order('created_at',{ascending:false});if(error)throw error;res.json(data||[])}catch(error){console.error(error);res.status(500).json({error:'Erro ao carregar avaliações.'})}
 });
 app.patch('/api/admin/ratings/:id/status', requireAuth, async(req,res)=>{
-  try{const status=String(req.body.status||'');if(!['published','hidden'].includes(status))return res.status(400).json({error:'Estado inválido.'});const {data,error}=await supabase.from('professional_ratings').update({status,updated_at:new Date().toISOString()}).eq('id',req.params.id).select('professional_id').maybeSingle();if(error)throw error;if(!data)return res.status(404).json({error:'Avaliação não encontrada.'});await supabase.from('moderation_logs').insert({id:crypto.randomUUID(),target_type:'rating',target_id:req.params.id,action:status,reason:String(req.body.reason||''),metadata:{admin:true},created_at:new Date().toISOString()});res.json({ok:true})}catch(error){console.error(error);res.status(500).json({error:'Erro ao moderar avaliação.'})}
+  try{const status=String(req.body.status||'');if(!['published','hidden'].includes(status))return res.status(400).json({error:'Estado inválido.'});const {data,error}=await supabase.from('professional_ratings').update({status,updated_at:new Date().toISOString()}).eq('id',req.params.id).select('professional_id').maybeSingle();if(error)throw error;if(!data)return res.status(404).json({error:'Avaliação não encontrada.'});await safeAuditLog({target_type:'rating',target_id:req.params.id,action:status,reason:String(req.body.reason||''),metadata:{admin:true}});res.json({ok:true})}catch(error){console.error(error);res.status(500).json({error:'Erro ao moderar avaliação.'})}
 });
 app.get('/api/admin/audit', requireAuth, async(_,res)=>{
   try{const {data,error}=await supabase.from('moderation_logs').select('*').order('created_at',{ascending:false}).limit(300);if(error)throw error;res.json(data||[])}catch(error){console.error(error);res.status(500).json({error:'Erro ao carregar auditoria.'})}
