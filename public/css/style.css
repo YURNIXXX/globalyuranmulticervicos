@@ -38,3 +38,6 @@
 .portfolio-media-wrap { position: relative; z-index: 1; overflow: hidden; }
 .portfolio-info { position: relative; z-index: 3; background: var(--surface); }
 .project-view-btn { position: relative; z-index: 5; pointer-events: auto; }
+
+/* === V6.2: cabeçalho apenas com logotipo + fundo configurável do hero === */
+.brand-logo{max-width:170px;max-height:48px;width:auto}.brand{min-width:72px}.hero.has-hero-bg{background-size:cover;background-position:center;background-repeat:no-repeat}.hero.has-hero-bg::before{content:"";position:absolute;inset:0;background:rgba(0,0,0,var(--hero-overlay,.24));z-index:0}.hero.has-hero-bg .hero-grid-bg{z-index:1}.hero.has-hero-bg .hero-content,.hero.has-hero-bg .hero-logo-stage{z-index:2}.modal-project-actions{display:flex;gap:10px;flex-wrap:wrap}.project-owner{display:flex;gap:6px;align-items:center;color:var(--muted);margin-top:8px}.professional-cta{background:var(--surface)}

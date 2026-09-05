@@ -1,7 +1,7 @@
 {
   "name": "yuranmultiservicos",
-  "version": "2.0.0",
-  "description": "Portfólio multi-serviços com painel administrativo, Supabase e deploy gratuito no Render.",
+  "version": "2.2.0",
+  "description": "Plataforma multi-serviços com profissionais, moderação, métricas, avaliações, denúncias, Supabase e Render.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
