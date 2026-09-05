@@ -87,7 +87,10 @@ function normalizeContent(content) {
   content.settings.primaryColor ||= '#151a16';
   content.settings.heroColor ||= '#00C9A7';
   content.settings.navHoverColor ||= '#00C9A7';
-  content.settings.logo ||= '';
+  content.settings.logo ||= ''; // legado V4/V6.2
+  content.settings.headerLogo ||= content.settings.logo || '';
+  content.settings.heroLogo ||= content.settings.logo || '';
+  content.settings.address ||= content.settings.location || '';
   content.settings.favicon ||= '';
   content.settings.heroBackgroundImage ||= '';
   content.settings.heroOverlay = content.settings.heroOverlay ?? '0.24';
@@ -118,7 +121,7 @@ function normalizeContent(content) {
     return next;
   });
   content.portfolio = (content.portfolio || []).map(p => ({ ...p, images: p.images?.length ? p.images : (p.image ? [p.image] : []), featured: typeof p.featured === 'boolean' ? p.featured : true }));
-  content.partners ||= []; content.links = (content.links || []).map(l => ({ ...l, iconClass: l.iconClass || 'bi-link-45deg' })); content.team ||= [];
+  content.partners = (content.partners || []).map(p => ({ ...p, logoLight: p.logoLight || p.logo || '', logoDark: p.logoDark || p.logo || '' })); content.links = (content.links || []).map(l => ({ ...l, iconClass: l.iconClass || 'bi-link-45deg' })); content.team ||= [];
   return content;
 }
 
@@ -254,13 +257,20 @@ app.put('/api/admin/settings', requireAuth, async (req, res) => {
   } catch (error) { console.error(error); res.status(500).json({ error: 'Erro ao guardar configurações.' }); }
 });
 
-app.post('/api/admin/settings/assets', requireAuth, imageUpload.fields([{ name: 'logo', maxCount: 1 }, { name: 'favicon', maxCount: 1 }, { name: 'heroBackground', maxCount: 1 }]), async (req, res) => {
+app.post('/api/admin/settings/assets', requireAuth, imageUpload.fields([{ name: 'headerLogo', maxCount: 1 }, { name: 'heroLogo', maxCount: 1 }, { name: 'logo', maxCount: 1 }, { name: 'favicon', maxCount: 1 }, { name: 'heroBackground', maxCount: 1 }]), async (req, res) => {
   try {
     const data = await readData();
     data.settings ||= {};
+    if (req.files?.headerLogo?.[0]) {
+      data.settings.headerLogo = await saveUpload(req.files.headerLogo[0], 'images');
+    }
+    if (req.files?.heroLogo?.[0]) {
+      data.settings.heroLogo = await saveUpload(req.files.heroLogo[0], 'images');
+    }
+    // Compatibilidade com formulários antigos: um logo legado preenche as duas áreas.
     if (req.files?.logo?.[0]) {
-      if (data.settings.logo) await deleteUpload(data.settings.logo);
-      data.settings.logo = await saveUpload(req.files.logo[0], 'images');
+      const legacy = await saveUpload(req.files.logo[0], 'images');
+      data.settings.logo = legacy; data.settings.headerLogo = legacy; data.settings.heroLogo = legacy;
     }
     if (req.files?.favicon?.[0]) {
       if (data.settings.favicon) await deleteUpload(data.settings.favicon);
@@ -352,17 +362,20 @@ app.delete('/api/admin/services/:id', requireAuth, async (req, res) => {
 });
 
 // PARCEIROS: upload de logo + URL externa normalizada.
-app.post('/api/admin/partners', requireAuth, imageUpload.single('logo'), async (req, res) => {
+app.post('/api/admin/partners', requireAuth, imageUpload.fields([{ name: 'logoLight', maxCount: 1 }, { name: 'logoDark', maxCount: 1 }, { name: 'logo', maxCount: 1 }]), async (req, res) => {
   try {
     const data = await readData();
-    const item = { id: uid('partner'), name: req.body.name || 'Parceiro', logo: req.file ? await saveUpload(req.file, 'images') : '', url: normalizeUrl(req.body.url) };
+    const legacy = req.files?.logo?.[0] ? await saveUpload(req.files.logo[0], 'images') : '';
+    const logoLight = req.files?.logoLight?.[0] ? await saveUpload(req.files.logoLight[0], 'images') : legacy;
+    const logoDark = req.files?.logoDark?.[0] ? await saveUpload(req.files.logoDark[0], 'images') : legacy;
+    const item = { id: uid('partner'), name: req.body.name || 'Parceiro', logo: legacy, logoLight, logoDark, url: normalizeUrl(req.body.url) };
     data.partners.push(item); await writeData(data); res.json(item);
   } catch (error) { console.error(error); res.status(500).json({ error: 'Erro ao adicionar parceiro.' }); }
 });
 app.delete('/api/admin/partners/:id', requireAuth, async (req, res) => {
   try {
     const data = await readData(); const item = data.partners.find(i => i.id === req.params.id);
-    if (item?.logo) await deleteUpload(item.logo);
+    for (const url of new Set([item?.logo, item?.logoLight, item?.logoDark].filter(Boolean))) await deleteUpload(url);
     data.partners = data.partners.filter(i => i.id !== req.params.id); await writeData(data); res.json({ ok: true });
   } catch (error) { console.error(error); res.status(500).json({ error: 'Erro ao remover parceiro.' }); }
 });
@@ -689,12 +702,12 @@ app.delete('/api/professional/projects/:id', requireProfessional, async (req, re
   } catch (error) { console.error(error); res.status(500).json({ error: 'Erro ao remover projeto.' }); }
 });
 
-// Público: perfis aprovados e verificados.
+// Público: perfis aprovados. O selo `verified` é um distintivo manual da administração.
 app.get('/api/professionals', async (req, res) => {
   try {
     await releaseExpiredSuspensions();
     const [{ data: profiles, error: pe }, { data: services, error: se }] = await Promise.all([
-      supabase.from('professional_profiles').select('id,name,slug,photo,specialty,bio,location,verified').eq('status', 'approved').eq('verified', true).order('created_at', { ascending: false }),
+      supabase.from('professional_profiles').select('id,name,slug,photo,specialty,bio,location,verified').eq('status', 'approved').order('created_at', { ascending: false }),
       supabase.from('professional_services').select('id,professional_id,title,category').eq('status', 'approved').order('created_at', { ascending: false })
     ]);
     if (pe) throw pe; if (se) throw se;
@@ -707,7 +720,7 @@ app.get('/api/professionals', async (req, res) => {
 app.get('/api/professionals/:slug', async (req, res) => {
   try {
     await releaseExpiredSuspensions();
-    const { data: profile, error } = await supabase.from('professional_profiles').select('id,name,slug,photo,specialty,bio,location,phone,whatsapp,email,website,linkedin,instagram,cv_url,verified').eq('slug', req.params.slug).eq('status', 'approved').eq('verified', true).maybeSingle();
+    const { data: profile, error } = await supabase.from('professional_profiles').select('id,name,slug,photo,specialty,bio,location,phone,whatsapp,email,website,linkedin,instagram,cv_url,verified').eq('slug', req.params.slug).eq('status', 'approved').maybeSingle();
     if (error) throw error; if (!profile) return res.status(404).json({ error: 'Profissional não encontrado.' });
     const [{ data: services, error: se }, { data: projects, error: pe }, { data: ratings, error: re }] = await Promise.all([
       supabase.from('professional_services').select('id,title,slug,category,description,price').eq('professional_id', profile.id).eq('status', 'approved').order('created_at', { ascending: false }),
@@ -722,7 +735,7 @@ app.get('/api/professionals/:slug', async (req, res) => {
 });
 app.post('/api/professionals/:slug/contact', async (req, res) => {
   try {
-    const { data: profile, error } = await supabase.from('professional_profiles').select('id').eq('slug', req.params.slug).eq('status', 'approved').eq('verified', true).maybeSingle();
+    const { data: profile, error } = await supabase.from('professional_profiles').select('id').eq('slug', req.params.slug).eq('status', 'approved').maybeSingle();
     if (error) throw error; if (!profile) return res.status(404).json({ error: 'Profissional não encontrado.' });
     const serviceId = req.body.serviceId || null, channel = String(req.body.channel || 'whatsapp').slice(0,30), scopeKey = `${channel}:${serviceId || 'general'}`;
     await recordProfessionalEvent(req, profile.id, 'contact', { serviceId, channel, scopeKey });
@@ -733,7 +746,7 @@ app.post('/api/professionals/:slug/rating', async (req, res) => {
   try {
     const stars = Number(req.body.stars), scopeKey = String(req.body.scopeKey || 'general'), comment = String(req.body.comment || '').trim().slice(0,1000);
     if (![1,2,3,4,5].includes(stars)) return res.status(400).json({ error: 'Escolha de 1 a 5 estrelas.' });
-    const { data: profile, error } = await supabase.from('professional_profiles').select('id').eq('slug', req.params.slug).eq('status', 'approved').eq('verified', true).maybeSingle();
+    const { data: profile, error } = await supabase.from('professional_profiles').select('id').eq('slug', req.params.slug).eq('status', 'approved').maybeSingle();
     if (error) throw error; if (!profile) return res.status(404).json({ error: 'Profissional não encontrado.' });
     let serviceId = null;
     if (scopeKey !== 'general') {
@@ -761,7 +774,7 @@ app.post('/api/professionals/:slug/report', async (req, res) => {
 });
 app.get('/api/featured-professional-projects', async (_, res) => {
   try {
-    const { data, error } = await supabase.from('professional_projects').select('id,title,description,project_url,images,professional_profiles!inner(name,slug,specialty,status,verified)').eq('status', 'approved').eq('featured', true).eq('professional_profiles.status', 'approved').eq('professional_profiles.verified', true).order('updated_at', { ascending: false }).limit(12);
+    const { data, error } = await supabase.from('professional_projects').select('id,title,description,project_url,images,professional_profiles!inner(name,slug,specialty,status,verified)').eq('status', 'approved').eq('featured', true).eq('professional_profiles.status', 'approved').order('updated_at', { ascending: false }).limit(12);
     if (error) throw error;
     res.json((data || []).map(x => ({ id: x.id, title: x.title, description: x.description, link: x.project_url, images: x.images || [], image: x.images?.[0] || '', service: x.professional_profiles?.specialty || 'Profissional', professionalName: x.professional_profiles?.name || '', professionalSlug: x.professional_profiles?.slug || '' })));
   } catch (error) { console.error(error); res.json([]); }
@@ -828,12 +841,25 @@ app.patch('/api/admin/professionals/:id/verification', requireAuth, async (req, 
     const status = String(req.body.status || ''), reason = String(req.body.reason || '').trim();
     if (!['approved','rejected','pending'].includes(status)) return res.status(400).json({ error: 'Estado de verificação inválido.' });
     if (status === 'rejected' && !reason) return res.status(400).json({ error: 'Informe o motivo da rejeição.' });
-    const update = { verification_status: status, verification_reason: status === 'rejected' ? reason : '', verified: status === 'approved', identity_verified_at: status === 'approved' ? new Date().toISOString() : null, updated_at: new Date().toISOString() };
+    const update = { verification_status: status, verification_reason: status === 'rejected' ? reason : '', identity_verified_at: status === 'approved' ? new Date().toISOString() : null, updated_at: new Date().toISOString() };
     const { data, error } = await supabase.from('professional_profiles').update(update).eq('id', req.params.id).select('*').single();
     if (error) throw error;
     await supabase.from('moderation_logs').insert({ id: crypto.randomUUID(), target_type: 'identity', target_id: req.params.id, action: status, reason, created_at: new Date().toISOString() });
     res.json(data);
   } catch (error) { console.error(error); res.status(500).json({ error: 'Erro ao validar identidade.' }); }
+});
+
+app.patch('/api/admin/professionals/:id/verified', requireAuth, async (req, res) => {
+  try {
+    const verified = req.body.verified === true || req.body.verified === 'true';
+    const { data: current, error: ce } = await supabase.from('professional_profiles').select('id,status,verification_status').eq('id', req.params.id).maybeSingle();
+    if (ce) throw ce; if (!current) return res.status(404).json({ error: 'Profissional não encontrado.' });
+    if (verified && (current.status !== 'approved' || current.verification_status !== 'approved')) return res.status(400).json({ error: 'Aprove o perfil e valide a identidade antes de atribuir o selo verificado.' });
+    const { data, error } = await supabase.from('professional_profiles').update({ verified, updated_at: new Date().toISOString() }).eq('id', req.params.id).select('*').single();
+    if (error) throw error;
+    await supabase.from('moderation_logs').insert({ id: crypto.randomUUID(), target_type: 'professional', target_id: req.params.id, action: verified ? 'verified_badge_on' : 'verified_badge_off', reason: 'Selo público alterado manualmente pela administração.', created_at: new Date().toISOString() });
+    res.json(data);
+  } catch (error) { console.error(error); res.status(500).json({ error: error.message || 'Erro ao alterar selo verificado.' }); }
 });
 
 app.get('/api/admin/analytics', requireAuth, async (req, res) => {

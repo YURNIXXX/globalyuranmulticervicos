@@ -1,17 +1,19 @@
 (()=>{
   const $=(s,r=document)=>r.querySelector(s), $$=(s,r=document)=>[...r.querySelectorAll(s)];
-  const escUrl=v=>String(v||'').replace(/"/g,'%22');
+  const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const safeUrl=v=>String(v||'').replace(/"/g,'%22');
   async function applyBrand(){
     try{
       const r=await fetch('/api/site'); const d=await r.json(); const s=d.settings||{};
       document.documentElement.style.setProperty('--primary-custom',s.primaryColor||'#151a16');
       document.documentElement.style.setProperty('--nav-hover',s.navHoverColor||'#00C9A7');
-      const logo=$('#sharedBrandLogo'), mark=$('#sharedBrandMark');
-      if(logo&&mark){if(s.logo){logo.src=s.logo;logo.hidden=false;mark.hidden=true}else{logo.hidden=true;mark.hidden=false}}
+      const logo=$('#sharedBrandLogo'), mark=$('#sharedBrandMark'), headerLogo=s.headerLogo||s.logo||'';
+      if(logo&&mark){if(headerLogo){logo.src=headerLogo;logo.hidden=false;mark.hidden=true}else{logo.hidden=true;mark.hidden=false}}
       let fav=$('#sharedFavicon'); if(!fav){fav=document.createElement('link');fav.rel='icon';fav.id='sharedFavicon';document.head.appendChild(fav)} if(s.favicon)fav.href=s.favicon;
-      const footerName=$('#sharedFooterName'); if(footerName)footerName.textContent=s.siteName||'Yuran Multicerviços';
+      const siteName=s.siteName||'Yuran Multicerviços',footerName=$('#sharedFooterName'),copyName=$('#sharedCopyrightName'),tagline=$('#sharedFooterTagline'); if(footerName)footerName.textContent=siteName;if(copyName)copyName.textContent=siteName;if(tagline)tagline.textContent=s.tagline||'Conectamos necessidades a profissionais preparados para entregar resultados.';
+      const contacts=$('#sharedFooterContacts');if(contacts){const items=[],address=s.address||s.location||'';if(s.phone)items.push(`<a href="tel:${esc(String(s.phone).replace(/[^+\d]/g,''))}"><i class="bi bi-telephone"></i><span>${esc(s.phone)}</span></a>`);if(s.email)items.push(`<a href="mailto:${esc(s.email)}"><i class="bi bi-envelope"></i><span>${esc(s.email)}</span></a>`);if(s.whatsapp){const wa=String(s.whatsapp).replace(/\D/g,'');items.push(`<a href="https://wa.me/${esc(wa)}" target="_blank" rel="noopener"><i class="bi bi-whatsapp"></i><span>WhatsApp</span></a>`)}if(address)items.push(`<span><i class="bi bi-geo-alt"></i><span>${esc(address)}</span></span>`);contacts.innerHTML=items.join('')}
       const footerSocial=$('#sharedSocialLinks');
-      if(footerSocial){const map={Instagram:'bi-instagram',Facebook:'bi-facebook',LinkedIn:'bi-linkedin',YouTube:'bi-youtube',TikTok:'bi-tiktok',X:'bi-twitter-x',WhatsApp:'bi-whatsapp',Telegram:'bi-telegram',Pinterest:'bi-pinterest',GitHub:'bi-github',Behance:'bi-behance',Dribbble:'bi-dribbble',Website:'bi-globe2'};footerSocial.innerHTML=(d.socials||[]).filter(x=>x.url&&x.url!=='#').map(x=>`<a class="social-icon-link" href="${escUrl(x.url)}" target="_blank" rel="noopener" aria-label="${x.platform||'Rede social'}"><i class="bi ${x.iconClass||map[x.platform]||'bi-link-45deg'}"></i></a>`).join('')}
+      if(footerSocial){const map={Instagram:'bi-instagram',Facebook:'bi-facebook',LinkedIn:'bi-linkedin',YouTube:'bi-youtube',TikTok:'bi-tiktok',X:'bi-twitter-x',WhatsApp:'bi-whatsapp',Telegram:'bi-telegram',Pinterest:'bi-pinterest',GitHub:'bi-github',Behance:'bi-behance',Dribbble:'bi-dribbble',Website:'bi-globe2'};footerSocial.innerHTML=(d.socials||[]).filter(x=>x.url&&x.url!=='#').map(x=>`<a class="social-icon-link" href="${safeUrl(x.url)}" target="_blank" rel="noopener" aria-label="${esc(x.platform||'Rede social')}"><i class="bi ${esc(x.iconClass||map[x.platform]||'bi-link-45deg')}"></i></a>`).join('')}
     }catch(e){console.error(e)}
   }
   const saved=localStorage.getItem('theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.dataset.theme=saved;
