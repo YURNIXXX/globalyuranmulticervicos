@@ -17,7 +17,7 @@
 </head>
 <body>
 <header class="site-header">
-  <a href="#inicio" class="brand" aria-label="Página inicial"><span class="brand-mark" id="brandMark">Y</span><img class="brand-logo" id="brandLogo" alt="Logotipo" hidden></a>
+  <a href="#inicio" class="brand" aria-label="Página inicial"><span class="brand-mark" id="brandMark" hidden>Y</span><img class="brand-logo" id="brandLogo" alt="Logotipo" hidden></a>
   <nav class="nav" id="nav">
     <a href="#inicio">Início</a><a href="#servicos">Serviços</a><a href="/profissionais">Profissionais</a><a href="/categorias">Categorias</a><a href="/como-funciona">Como funciona</a><a href="#sobre">Sobre</a><a href="/profissional">Área profissional</a>
   </nav>
@@ -48,5 +48,5 @@
 <footer class="footer footer-pro"><div class="footer-brand-block"><strong id="footerName"></strong><p id="footerTagline">Conectamos necessidades a profissionais preparados para entregar resultados.</p></div><div class="footer-contact-row" id="footerContacts"></div><div class="footer-social-row" id="socialLinks"></div><div class="footer-bottom"><small>© <span id="year"></span> <span id="footerCopyrightName"></span>. Todos os direitos reservados.</small><div class="footer-links"><a href="/como-funciona">Como funciona</a><a href="/ajuda">Ajuda</a><a href="/politica-de-privacidade">Privacidade</a><a href="/termos-de-uso">Termos</a><a href="/profissional">Área profissional</a></div></div></footer>
 <dialog class="portfolio-modal" id="portfolioModal"><div class="portfolio-modal-shell"><button class="modal-close portfolio-close" id="portfolioClose"><i class="bi bi-x-lg"></i></button><div class="gallery-stage"><button class="gallery-arrow left" id="galleryPrev" aria-label="Imagem anterior"><i class="bi bi-chevron-left"></i></button><img id="galleryImage" alt=""><button class="gallery-arrow right" id="galleryNext" aria-label="Próxima imagem"><i class="bi bi-chevron-right"></i></button><span class="gallery-count" id="galleryCount"></span></div><div class="portfolio-modal-info"><span class="eyebrow" id="modalService"></span><h2 id="modalProjectTitle"></h2><p id="modalProjectDescription"></p><div class="modal-project-actions"><a class="btn ghost" id="modalProfessionalLink" hidden>Ver profissional <i class="bi bi-person"></i></a></div></div></div></dialog>
 
-<script src="/js/app.js"></script><script>if('serviceWorker'in navigator)window.addEventListener('load',()=>navigator.serviceWorker.register('/sw.js').catch(()=>{}));</script>
+<script src="/js/app.js"></script><script>if('serviceWorker'in navigator)window.addEventListener('load',()=>navigator.serviceWorker.register('/sw.js',{updateViaCache:'none'}).then(r=>r.update()).catch(()=>{}));</script>
 </body></html>

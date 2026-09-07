@@ -122,8 +122,8 @@ app.use('/api/professional/recovery-request', authLimiter);
 app.use('/api/professional/reset-password', authLimiter);
 app.use('/api/professional/register', registerLimiter);
 
-app.use(express.static(path.join(__dirname, 'public'), { maxAge: IS_PRODUCTION ? '1h' : 0 }));
-app.use('/admin', express.static(path.join(__dirname, 'admin'), { maxAge: IS_PRODUCTION ? '1h' : 0 }));
+app.use(express.static(path.join(__dirname, 'public'), { maxAge: 0, etag: true, setHeaders(res, filePath) { if (/\.(?:html|js|css)$/i.test(filePath) || /sw\.js$/i.test(filePath)) res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate'); } }));
+app.use('/admin', express.static(path.join(__dirname, 'admin'), { maxAge: 0, etag: true, setHeaders(res, filePath) { if (/\.(?:html|js|css)$/i.test(filePath)) res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate'); } }));
 
 function readLocalData() { return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')); }
 function writeLocalData(data) { fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2), 'utf8'); }
@@ -136,6 +136,16 @@ function normalizeUrl(value = '') {
   if (!v || v === '#') return v || '#';
   if (/^(https?:)?\/\//i.test(v)) return v.startsWith('//') ? `https:${v}` : v;
   return `https://${v.replace(/^\/+/, '')}`;
+}
+function normalizeEducation(value = []) {
+  let rows = value;
+  if (typeof rows === 'string') { try { rows = JSON.parse(rows); } catch { rows = []; } }
+  if (!Array.isArray(rows)) rows = [];
+  return rows.slice(0, 3).map(x => ({
+    institution: String(x?.institution || '').trim().slice(0, 180),
+    course: String(x?.course || '').trim().slice(0, 180),
+    year: String(x?.year || '').replace(/\D/g, '').slice(0, 4)
+  })).filter(x => x.institution || x.course || x.year);
 }
 
 function hashPassword(password) {
@@ -224,7 +234,8 @@ async function notifyProfessional(professionalId, type, title, message, link = '
 
 ${PUBLIC_BASE_URL}${link}` : ''}`);
     if (sent) await supabase.from('professional_notifications').update({ email_sent: true }).eq('id', id);
-  } catch (e) { console.error('Notificação não registada:', e.message); }
+    return { notificationId: id, emailSent: sent, email: profile?.email || '' };
+  } catch (e) { console.error('Notificação não registada:', e.message); return { notificationId: '', emailSent: false, email: '' }; }
 }
 async function safeAuditLog({ target_type, target_id, action, reason = '', metadata = {} }) {
   try {
@@ -612,15 +623,7 @@ app.post('/api/admin/team', requireAuth, imageUpload.single('photo'), async (req
     data.team.push(item); await writeData(data); res.json(item);
   } catch (error) { console.error(error); res.status(500).json({ error: 'Erro ao adicionar profissional.' }); }
 });
-app.post('/api/admin/team/:id/cv', requireAuth, cvUpload.single('cv'), async (req, res) => {
-  try {
-    const data = await readData(); const index = data.team.findIndex(i => i.id === req.params.id);
-    if (index < 0) return res.status(404).json({ error: 'Profissional não encontrado.' });
-    if (!req.file) return res.status(400).json({ error: 'Envie um PDF.' });
-    if (data.team[index].cv) await deleteUpload(data.team[index].cv);
-    data.team[index].cv = await saveUpload(req.file, 'cvs'); await writeData(data); res.json(data.team[index]);
-  } catch (error) { console.error(error); res.status(500).json({ error: 'Erro ao guardar CV.' }); }
-});
+app.post('/api/admin/team/:id/cv', requireAuth, (_, res) => res.status(410).json({ error: 'Currículos agora pertencem aos perfis profissionais cadastrados.' }));
 app.delete('/api/admin/team/:id', requireAuth, async (req, res) => {
   try {
     const data = await readData(); const item = data.team.find(i => i.id === req.params.id);
@@ -722,7 +725,7 @@ app.post('/api/professional/register', identityUpload.fields([{ name: 'idFront',
     if (profileError) { await supabase.from('professional_users').delete().eq('id', userId); throw profileError; }
     await regenerateSession(req);
     req.session.professionalId = profileId;
-    await notifyProfessional(profileId, 'account', 'Conta criada com sucesso', 'Recebemos o seu cadastro e os documentos de identificação. A sua conta está agora em análise.', '/profissional/dashboard');
+    await notifyProfessional(profileId, 'account', 'Cadastro recebido — perfil e documentação em análise', 'Recebemos o seu cadastro e os documentos de identificação. O seu perfil e a documentação estão agora em análise. Pode completar o perfil enquanto aguarda a validação.', '/profissional/dashboard');
     res.json({ ok: true, profile: { id: profileId, name, slug, email, status: 'pending', verification_status: 'pending' } });
   } catch (error) {
     console.error(error);
@@ -876,7 +879,7 @@ app.put('/api/professional/profile', requireProfessional, imageUpload.fields([{ 
       ...current, name, specialty: String(req.body.specialty || '').trim(), headline: String(req.body.headline || '').trim().slice(0,120), bio: String(req.body.bio || '').trim(), address,
       location: String(req.body.location || '').trim(), phone, whatsapp, website: normalizeUrl(req.body.website || ''), linkedin: normalizeUrl(req.body.linkedin || ''), instagram: normalizeUrl(req.body.instagram || ''), photo,
       years_experience: Math.max(0, Math.min(80, Number(req.body.years_experience || 0))), service_area: String(req.body.service_area || '').trim(), availability: ['available','limited','unavailable'].includes(String(req.body.availability)) ? String(req.body.availability) : 'available',
-      languages: String(req.body.languages || '').trim().slice(0,500), skills: String(req.body.skills || '').trim().slice(0,1000), certifications: String(req.body.certifications || '').trim().slice(0,1500), response_time_label: String(req.body.response_time_label || '').trim().slice(0,100)
+      languages: String(req.body.languages || '').trim().slice(0,500), skills: String(req.body.skills || '').trim().slice(0,1000), certifications: String(req.body.certifications || '').trim().slice(0,1500), education: normalizeEducation(req.body.education), response_time_label: String(req.body.response_time_label || '').trim().slice(0,100)
     };
     const update = { ...candidate, slug: name !== current.name ? await uniqueProfessionalSlug(name, current.id) : current.slug, status: current.status === 'approved' ? 'pending' : current.status, profile_completeness: profileCompleteness(candidate), last_active_at: new Date().toISOString(), updated_at: new Date().toISOString() };
     delete update.user_id; delete update.id_front_path; delete update.id_back_path; delete update.created_at; delete update.id; delete update.verification_status; delete update.verified; delete update.warning_count; delete update.last_warning; delete update.suspended_until; delete update.suspension_reason; delete update.pre_suspension_status; delete update.identity_submitted_at; delete update.identity_verified_at; delete update.identity_retention_until; delete update.identity_documents_deleted_at; delete update.terms_accepted_at; delete update.privacy_accepted_at; delete update.rejection_reason; delete update.email; delete update.cv_url; delete update.featured;
@@ -1022,7 +1025,7 @@ app.get('/api/professionals', async (req, res) => {
 app.get('/api/professionals/:slug', async (req, res) => {
   try {
     await releaseExpiredSuspensions();
-    const { data: profile, error } = await supabase.from('professional_profiles').select('id,name,slug,photo,specialty,headline,bio,location,phone,whatsapp,email,website,linkedin,instagram,cv_url,verified,verification_status,featured,years_experience,service_area,availability,languages,skills,certifications,response_time_label,profile_completeness,created_at,last_active_at').eq('slug', req.params.slug).eq('status', 'approved').maybeSingle();
+    const { data: profile, error } = await supabase.from('professional_profiles').select('id,name,slug,photo,specialty,headline,bio,location,phone,whatsapp,email,website,linkedin,instagram,cv_url,verified,verification_status,featured,years_experience,service_area,availability,languages,skills,certifications,education,response_time_label,profile_completeness,created_at,last_active_at').eq('slug', req.params.slug).eq('status', 'approved').maybeSingle();
     if (error) throw error; if (!profile) return res.status(404).json({ error: 'Profissional não encontrado.' });
     const [{ data: services, error: se }, { data: projects, error: pe }, { data: ratings, error: re }, { data: events }] = await Promise.all([
       supabase.from('professional_services').select('id,title,slug,category,description,price,service_area,availability,delivery_time,cover_image').eq('professional_id', profile.id).eq('status', 'approved').order('featured',{ascending:false}).order('created_at', { ascending: false }),
@@ -1100,7 +1103,7 @@ app.get('/profissional', (_, res) => res.sendFile(path.join(__dirname, 'public',
 app.get('/profissional/google-callback', (_, res) => res.sendFile(path.join(__dirname, 'public', 'professional-google-callback.html')));
 app.get('/profissional/dashboard', (_, res) => res.sendFile(path.join(__dirname, 'professional', 'dashboard.html')));
 app.get('/profissional/:slug', (_, res) => res.sendFile(path.join(__dirname, 'public', 'professional-profile.html')));
-app.use('/professional-assets', express.static(path.join(__dirname, 'professional')));
+app.use('/professional-assets', express.static(path.join(__dirname, 'professional'), { maxAge: 0, etag: true, setHeaders(res, filePath) { if (/\.(?:html|js|css)$/i.test(filePath)) res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate'); } }));
 
 // Moderação administrativa.
 app.get('/api/admin/moderation', requireAuth, async (req, res) => {
@@ -1134,7 +1137,7 @@ app.patch('/api/admin/moderation/:type/:id', requireAuth, async (req, res) => {
     await safeAuditLog({ target_type: req.params.type, target_id: req.params.id, action: status, reason: String(req.body.rejection_reason || ''), metadata: { admin: true } });
     let professionalId = table === 'professional_profiles' ? data.id : data.professional_id;
     const typeLabel = table === 'professional_profiles' ? 'perfil' : table === 'professional_services' ? 'serviço' : 'projeto';
-    const message = status === 'approved' ? `O seu ${typeLabel} foi aprovado.` : status === 'rejected' ? `O seu ${typeLabel} foi rejeitado. Motivo: ${String(req.body.rejection_reason || 'Consulte o painel.')}` : status === 'suspended' ? `O seu ${typeLabel} foi suspenso pela administração.` : `O seu ${typeLabel} voltou para análise.`;
+    const message = status === 'approved' ? (table === 'professional_profiles' ? 'A sua documentação já foi validada e o seu perfil profissional foi aprovado. O perfil pode agora ficar disponível ao público, de acordo com as regras da plataforma.' : `O seu ${typeLabel} foi aprovado.`) : status === 'rejected' ? `O seu ${typeLabel} foi rejeitado. Motivo: ${String(req.body.rejection_reason || 'Consulte o painel.')}` : status === 'suspended' ? `O seu ${typeLabel} foi suspenso pela administração.` : `O seu ${typeLabel} voltou para análise.`;
     await notifyProfessional(professionalId, 'moderation', `${typeLabel[0].toUpperCase()+typeLabel.slice(1)}: ${status === 'approved' ? 'aprovado' : status === 'rejected' ? 'rejeitado' : status === 'suspended' ? 'suspenso' : 'em análise'}`, message, '/profissional/dashboard');
     res.json(data);
   } catch (error) { console.error(error); res.status(500).json({ error: error.message || 'Erro ao moderar item.' }); }
@@ -1171,7 +1174,7 @@ app.patch('/api/admin/professionals/:id/verification', requireAuth, async (req, 
     const { data, error } = await supabase.from('professional_profiles').update(update).eq('id', req.params.id).select('*').single();
     if (error) throw error;
     await safeAuditLog({ target_type: 'identity', target_id: req.params.id, action: status, reason, metadata: { retention_days: IDENTITY_RETENTION_DAYS } });
-    await notifyProfessional(req.params.id, 'identity', status === 'approved' ? 'Identidade validada' : status === 'rejected' ? 'Documento precisa ser reenviado' : 'Identidade em análise', status === 'approved' ? 'A sua identidade foi validada. Agora complete o perfil e envie os seus serviços e projetos para revisão.' : status === 'rejected' ? `A validação do documento foi recusada. Motivo: ${reason}` : 'Os seus documentos estão em análise.', '/profissional/dashboard');
+    await notifyProfessional(req.params.id, 'identity', status === 'approved' ? 'Identidade validada' : status === 'rejected' ? 'Documento precisa ser reenviado' : 'Identidade em análise', status === 'approved' ? 'A sua documentação de identificação foi aprovada. Continue a completar o perfil; a publicação pública do perfil depende ainda da aprovação administrativa do conteúdo profissional.' : status === 'rejected' ? `A validação do documento foi recusada. Motivo: ${reason}` : 'Os seus documentos estão em análise.', '/profissional/dashboard');
     res.json(data);
   } catch (error) { console.error(error); res.status(500).json({ error: error.message || 'Erro ao validar identidade.' }); }
 });
@@ -1210,6 +1213,7 @@ app.put('/api/admin/professionals/:id', requireAuth, async (req, res) => {
       skills: String(req.body.skills ?? current.skills ?? '').trim(),
       languages: String(req.body.languages ?? current.languages ?? '').trim(),
       certifications: String(req.body.certifications ?? current.certifications ?? '').trim(),
+      education: req.body.education !== undefined ? normalizeEducation(req.body.education) : normalizeEducation(current.education || []),
       years_experience: Math.max(0, Math.min(80, Number(req.body.years_experience ?? current.years_experience ?? 0) || 0)),
       availability
     };
@@ -1226,6 +1230,7 @@ app.put('/api/admin/professionals/:id', requireAuth, async (req, res) => {
       skills: candidate.skills,
       languages: candidate.languages,
       certifications: candidate.certifications,
+      education: candidate.education,
       years_experience: candidate.years_experience,
       availability: candidate.availability,
       profile_completeness: profileCompleteness(candidate),
@@ -1259,6 +1264,45 @@ app.delete('/api/admin/professionals/:id', requireAuth, async (req, res) => {
     if (req.session.professionalId === profile.id) delete req.session.professionalId;
     res.json({ ok: true });
   } catch (error) { console.error(error); res.status(500).json({ error: error.message || 'Erro ao excluir profissional.' }); }
+});
+
+
+app.get('/api/admin/email-center', requireAuth, async (req, res) => {
+  try {
+    const [{ data: professionals, error: pe }, { data: logs, error: le }] = await Promise.all([
+      supabase.from('professional_profiles').select('id,name,email,status,verification_status').order('name', { ascending: true }),
+      supabase.from('admin_email_logs').select('*').order('created_at', { ascending: false }).limit(50)
+    ]);
+    if (pe) throw pe;
+    res.json({ configured: Boolean(RESEND_API_KEY && EMAIL_FROM), from: EMAIL_FROM || '', professionals: professionals || [], logs: le ? [] : (logs || []) });
+  } catch (error) { console.error(error); res.status(500).json({ error: 'Erro ao carregar centro de comunicação.' }); }
+});
+app.post('/api/admin/emails/send', requireAuth, async (req, res) => {
+  try {
+    if (!RESEND_API_KEY || !EMAIL_FROM) return res.status(503).json({ error: 'O envio de e-mail ainda não está configurado. Adicione RESEND_API_KEY e EMAIL_FROM no Render.' });
+    const audience = String(req.body.audience || 'individual');
+    const professionalId = String(req.body.professional_id || '');
+    const subject = String(req.body.subject || '').trim().slice(0, 160);
+    const message = String(req.body.message || '').trim().slice(0, 5000);
+    if (subject.length < 3 || message.length < 5) return res.status(400).json({ error: 'Informe assunto e mensagem.' });
+    let q = supabase.from('professional_profiles').select('id,name,email,status').not('email','is',null).neq('email','');
+    if (audience === 'individual') {
+      if (!professionalId) return res.status(400).json({ error: 'Selecione um profissional.' });
+      q = q.eq('id', professionalId);
+    } else if (audience !== 'all') return res.status(400).json({ error: 'Público inválido.' });
+    const { data: recipients, error } = await q.order('name', { ascending: true }); if (error) throw error;
+    if (!recipients?.length) return res.status(404).json({ error: 'Nenhum destinatário encontrado.' });
+    let sent = 0, failed = 0;
+    for (let i = 0; i < recipients.length; i += 5) {
+      const batch = recipients.slice(i, i + 5);
+      const results = await Promise.all(batch.map(p => notifyProfessional(p.id, 'admin_message', subject, message, '/profissional/dashboard')));
+      for (const r of results) r.emailSent ? sent++ : failed++;
+      if (i + 5 < recipients.length) await new Promise(resolve => setTimeout(resolve, 350));
+    }
+    try { await supabase.from('admin_email_logs').insert({ id: crypto.randomUUID(), audience, professional_id: audience === 'individual' ? professionalId : null, subject, recipient_count: recipients.length, sent_count: sent, failed_count: failed, created_at: new Date().toISOString() }); } catch {}
+    await safeAuditLog({ target_type: 'communication', target_id: audience === 'individual' ? professionalId : 'all', action: 'email_sent', reason: subject, metadata: { recipient_count: recipients.length, sent, failed } });
+    res.json({ ok: true, recipients: recipients.length, sent, failed });
+  } catch (error) { console.error(error); res.status(500).json({ error: error.message || 'Erro ao enviar e-mails.' }); }
 });
 
 app.get('/api/admin/analytics', requireAuth, async (req, res) => {

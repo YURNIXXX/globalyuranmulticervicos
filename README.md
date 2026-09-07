@@ -1,34 +1,25 @@
-# Yuran Multicerviços — Plataforma V7.0
+# Yuran Multicerviços — Plataforma V7.2
 
-A Yuran Multicerviços evoluiu de um portfólio multi-serviços para uma plataforma de descoberta de profissionais, serviços e projetos, com moderação, identidade, reputação, métricas e contacto direto.
+Plataforma de descoberta e apresentação de profissionais, serviços e projetos, com moderação, verificação administrativa, reputação, métricas, comunicação e contacto direto.
 
-## Principais módulos
+## Destaques da V7.2
 
-- Site público responsivo com categorias, serviços, projetos e profissionais em destaque.
-- Diretório de profissionais com pesquisa e filtros por categoria, localização, disponibilidade, avaliação e selo verificado.
-- Perfil profissional completo com experiência, competências, idiomas, área de atendimento, CV, serviços, projetos e indicadores de confiança.
-- Página própria para cada serviço profissional.
-- Cadastro profissional com documento frente/verso em bucket privado.
-- Login por e-mail/senha e Google OAuth.
-- Painel do profissional com onboarding, notificações, avaliações, serviços, projetos e segurança.
-- Moderação administrativa de perfis, documentos, serviços, projetos, avaliações e denúncias.
-- Selo verificado atribuído manualmente pelo administrador e independente da aprovação documental.
-- Métricas de visualização/contacto e dashboard administrativo.
-- Avaliações condicionadas a uma interação de contacto registada.
-- Respostas públicas do profissional às avaliações.
-- Denúncias com protocolo e fluxo disciplinar.
-- Retenção e eliminação automática de documentos de identidade.
-- Sessões persistentes em Supabase.
-- 2FA TOTP opcional para o administrador.
-- Rate limiting, validação de assinatura real de uploads, Same-Origin Guard, Helmet/CSP e cookies seguros.
-- Política de Privacidade, Termos de Uso, Como funciona e Central de Ajuda.
-- Sitemap, robots.txt, metadados SEO e PWA básica.
-- Notificações transacionais por e-mail opcionais via Resend.
-- Recuperação de senha por link temporário quando o e-mail transacional estiver configurado; fallback administrativo quando não estiver.
+- Página inicial resiliente a refresh, cache antigo e falhas temporárias de API.
+- Cabeçalho com logotipo carregado pelo administrador, sem fallback genérico "Y".
+- Perfil profissional com idiomas estruturados e até 3 formações académicas.
+- Formação académica apresentada publicamente no perfil.
+- Botão **Completar perfil** corrigido.
+- Melhorias de espaçamento e navegação mobile.
+- Modais administrativos próprios em vez de `prompt/confirm` do navegador.
+- Nova área **Admin > Comunicação** para e-mail individual ou geral.
+- Notificações internas e e-mails automáticos para eventos importantes da conta, quando Resend estiver configurado.
+- Cache PWA V7.2 e recursos principais em `network-first`.
 
 ## Instalação
 
-Leia `INSTALACAO-V7.0.txt` antes de fazer o deploy. O arquivo `supabase-v7.0.sql` deve ser executado no Supabase **antes** de colocar o código V7.0 no Render.
+1. Execute `supabase-v7.2.sql` uma única vez no Supabase.
+2. Faça o deploy do código no GitHub/Render.
+3. Leia `INSTALACAO-V7.2.txt` para configuração de e-mail e testes.
 
 ## Segurança
 
@@ -39,4 +30,4 @@ Nunca publique no GitHub:
 - `SESSION_SECRET`
 - `RESEND_API_KEY`
 
-Esses valores pertencem exclusivamente às variáveis de ambiente do Render.
+Esses valores devem existir somente nas variáveis de ambiente do Render.
