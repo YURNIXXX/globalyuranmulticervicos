@@ -1,7 +1,7 @@
 {
   "name": "yuranmultiservicos",
-  "version": "3.0.0",
-  "description": "Plataforma profissional multi-serviços com verificação, moderação, confiança, SEO, PWA, métricas e segurança.",
+  "version": "7.3.0",
+  "description": "Yuran Multicerviços V7.3 — plataforma profissional com moderação, perfis oficiais, vídeo institucional e hardening de segurança.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

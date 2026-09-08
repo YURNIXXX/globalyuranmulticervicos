@@ -14,7 +14,8 @@ app.set('trust proxy', 1);
 const PORT = process.env.PORT || 3000;
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'mudar-esta-senha';
 const ADMIN_RECOVERY_KEY = process.env.ADMIN_RECOVERY_KEY || '';
-const SESSION_SECRET = process.env.SESSION_SECRET || 'troque-esta-chave-em-producao';
+const SESSION_SECRET_CONFIGURED = Boolean(process.env.SESSION_SECRET);
+const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(48).toString('hex');
 const SUPABASE_URL = process.env.SUPABASE_URL || '';
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_KEY || '';
@@ -27,6 +28,10 @@ const IDENTITY_RETENTION_DAYS = Math.min(365, Math.max(1, Number(process.env.IDE
 const IS_PRODUCTION = process.env.NODE_ENV === 'production' || process.env.RENDER === 'true';
 const USE_SUPABASE = Boolean(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY);
 const ALLOW_LOCAL_STORAGE = process.env.ALLOW_LOCAL_STORAGE === 'true';
+
+if (IS_PRODUCTION && !SESSION_SECRET_CONFIGURED) {
+  console.warn('AVISO DE SEGURANÇA: SESSION_SECRET não está configurada. Foi gerada uma chave temporária para esta instância; configure SESSION_SECRET no Render para sessões estáveis e seguras.');
+}
 
 // Nunca deixe produção cair silenciosamente para armazenamento local.
 // No Render, o sistema de ficheiros da instância é efémero e os dados seriam perdidos
@@ -75,7 +80,7 @@ app.use(helmet({
       imgSrc: ["'self'", 'data:', 'blob:', 'https:'],
       fontSrc: ["'self'", 'data:', 'https://cdn.jsdelivr.net'],
       connectSrc: cspConnect,
-      frameSrc: ["'self'", 'https:'],
+      frameSrc: ["'self'", 'https://www.youtube-nocookie.com', 'https://www.youtube.com'],
       objectSrc: ["'none'"],
       baseUri: ["'self'"],
       formAction: ["'self'"],
@@ -104,10 +109,15 @@ const feedbackLimiter = rateLimit({ windowMs: 60 * 60 * 1000, limit: 30, standar
 
 function sameOriginGuard(req, res, next) {
   const origin = req.get('origin');
+  const fetchSite = String(req.get('sec-fetch-site') || '').toLowerCase();
+  if (fetchSite && !['same-origin', 'none'].includes(fetchSite)) return res.status(403).json({ error: 'Origem da solicitação não autorizada.' });
   if (!origin) return next();
   try {
-    const expected = `${req.protocol}://${req.get('host')}`;
-    if (new URL(origin).origin !== new URL(expected).origin) return res.status(403).json({ error: 'Origem da solicitação não autorizada.' });
+    const forwardedProto = String(req.get('x-forwarded-proto') || req.protocol || 'https').split(',')[0].trim();
+    const requestOrigin = new URL(`${forwardedProto}://${req.get('host')}`).origin;
+    const allowed = new Set([requestOrigin]);
+    if (PUBLIC_BASE_URL) { try { allowed.add(new URL(PUBLIC_BASE_URL).origin); } catch {} }
+    if (!allowed.has(new URL(origin).origin)) return res.status(403).json({ error: 'Origem da solicitação não autorizada.' });
   } catch { return res.status(403).json({ error: 'Origem inválida.' }); }
   next();
 }
@@ -116,6 +126,7 @@ app.use('/api/professional', sameOriginGuard);
 app.use('/api/professionals', sameOriginGuard);
 app.use('/api/admin/login', authLimiter);
 app.use('/api/admin/login-2fa', authLimiter);
+app.use('/api/admin/recover-password', authLimiter);
 app.use('/api/professional/login', authLimiter);
 app.use('/api/professional/google-login', authLimiter);
 app.use('/api/professional/recovery-request', authLimiter);
@@ -193,6 +204,15 @@ function isValidImageBuffer(file) {
   return jpg || png || webp;
 }
 function isValidPdfBuffer(file) { return !!file?.buffer?.slice(0,5).equals(Buffer.from('%PDF-')); }
+function detectedUploadType(file) {
+  const b = file?.buffer;
+  if (!b) return null;
+  if (b.length >= 3 && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return { ext: '.jpg', mime: 'image/jpeg', kind: 'image' };
+  if (b.length >= 8 && b.slice(0,8).equals(Buffer.from([0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a]))) return { ext: '.png', mime: 'image/png', kind: 'image' };
+  if (b.length >= 12 && b.slice(0,4).toString() === 'RIFF' && b.slice(8,12).toString() === 'WEBP') return { ext: '.webp', mime: 'image/webp', kind: 'image' };
+  if (b.length >= 5 && b.slice(0,5).equals(Buffer.from('%PDF-'))) return { ext: '.pdf', mime: 'application/pdf', kind: 'pdf' };
+  return null;
+}
 function profileCompleteness(p = {}) {
   let score = 0;
   if (String(p.name||'').trim()) score += 5;
@@ -217,25 +237,70 @@ function profileQualityMissing(p = {}) {
   if (!String(p.service_area||'').trim()) missing.push('área de atendimento');
   return missing;
 }
-async function sendTransactionalEmail(to, subject, text) {
-  if (!RESEND_API_KEY || !EMAIL_FROM || !to) return false;
-  try {
-    const r = await fetch('https://api.resend.com/emails', { method: 'POST', headers: { 'Authorization': `Bearer ${RESEND_API_KEY}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ from: EMAIL_FROM, to: [to], subject, text }) });
-    return r.ok;
-  } catch (e) { console.error('E-mail não enviado:', e.message); return false; }
+function normalizeEmailFrom(value = '') {
+  // Evita um erro comum no Render: colar "EMAIL_FROM = ..." dentro do valor.
+  return String(value || '').trim().replace(/^EMAIL_FROM\s*=\s*/i, '').trim();
 }
-async function notifyProfessional(professionalId, type, title, message, link = '') {
+function emailConfigState() {
+  const from = normalizeEmailFrom(EMAIL_FROM);
+  const issues = [];
+  if (!RESEND_API_KEY) issues.push('RESEND_API_KEY não configurada.');
+  if (!from) issues.push('EMAIL_FROM não configurado.');
+  const match = from.match(/<([^>]+)>/) || from.match(/^([^\s<>]+@[^\s<>]+)$/);
+  const sender = String(match?.[1] || '').trim().toLowerCase();
+  if (from && !sender) issues.push('EMAIL_FROM inválido. Use: Yuran Multicerviços <email@dominio.com>.');
+  if (/@gmail\.com$/i.test(sender)) issues.push('A Resend não pode enviar usando um endereço @gmail.com como remetente. Use onboarding@resend.dev para teste ou um domínio seu verificado na Resend.');
+  return {
+    configured: issues.length === 0,
+    from,
+    sender,
+    testMode: /@resend\.dev$/i.test(sender),
+    warning: issues.join(' ')
+  };
+}
+function emailHtml(title, message, link = '') {
+  const safe = (v='') => String(v).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]));
+  const action = link && PUBLIC_BASE_URL ? `${PUBLIC_BASE_URL}${link}` : '';
+  return `<!doctype html><html><body style="margin:0;background:#f5f7f6;font-family:Arial,sans-serif;color:#111"><div style="max-width:620px;margin:0 auto;padding:32px 18px"><div style="background:#fff;border:1px solid #e3e7e4;border-radius:18px;padding:28px"><div style="font-size:13px;font-weight:700;letter-spacing:.08em;color:#087f6a;margin-bottom:10px">YURAN MULTICERVIÇOS</div><h1 style="font-size:24px;margin:0 0 16px">${safe(title)}</h1><p style="font-size:16px;line-height:1.65;color:#4d5752;white-space:pre-line">${safe(message)}</p>${action?`<p style="margin:24px 0 0"><a href="${safe(action)}" style="display:inline-block;background:#101813;color:#fff;text-decoration:none;padding:12px 18px;border-radius:10px;font-weight:700">Abrir área profissional</a></p>`:''}</div><p style="font-size:12px;color:#7d8580;text-align:center;margin:18px 0 0">Mensagem automática da Yuran Multicerviços.</p></div></body></html>`;
+}
+async function sendTransactionalEmail(to, subject, text, link = '') {
+  const config = emailConfigState();
+  if (!config.configured || !to) return { ok: false, error: !to ? 'Destinatário sem e-mail.' : config.warning, skipped: true };
+  try {
+    const r = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${RESEND_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: config.from, to: [to], subject, text, html: emailHtml(subject, text, link) })
+    });
+    let payload = {};
+    try { payload = await r.json(); } catch {}
+    if (!r.ok) {
+      const detail = payload?.message || payload?.error || `HTTP ${r.status}`;
+      console.error('Resend recusou o e-mail:', detail);
+      return { ok: false, error: String(detail), status: r.status };
+    }
+    return { ok: true, id: payload?.id || '' };
+  } catch (e) {
+    console.error('E-mail não enviado:', e.message);
+    return { ok: false, error: e.message };
+  }
+}
+async function notifyProfessional(professionalId, type, title, message, link = '', options = {}) {
   try {
     const { data: profile } = await supabase.from('professional_profiles').select('email,name').eq('id', professionalId).maybeSingle();
     const id = crypto.randomUUID();
     const { error } = await supabase.from('professional_notifications').insert({ id, professional_id: professionalId, type, title, message, link, created_at: new Date().toISOString() });
     if (error) throw error;
-    const sent = await sendTransactionalEmail(profile?.email, title, `${message}${link && PUBLIC_BASE_URL ? `
-
-${PUBLIC_BASE_URL}${link}` : ''}`);
-    if (sent) await supabase.from('professional_notifications').update({ email_sent: true }).eq('id', id);
-    return { notificationId: id, emailSent: sent, email: profile?.email || '' };
-  } catch (e) { console.error('Notificação não registada:', e.message); return { notificationId: '', emailSent: false, email: '' }; }
+    let emailResult = { ok: false, skipped: true, error: 'Envio externo não solicitado para esta notificação.' };
+    if (options.sendEmail === true) {
+      emailResult = await sendTransactionalEmail(profile?.email, title, message, link);
+      if (emailResult.ok) await supabase.from('professional_notifications').update({ email_sent: true }).eq('id', id);
+    }
+    return { notificationId: id, emailSent: Boolean(emailResult.ok), email: profile?.email || '', emailError: emailResult.error || '' };
+  } catch (e) {
+    console.error('Notificação não registada:', e.message);
+    return { notificationId: '', emailSent: false, email: '', emailError: e.message };
+  }
 }
 async function safeAuditLog({ target_type, target_id, action, reason = '', metadata = {} }) {
   try {
@@ -269,7 +334,13 @@ function normalizeContent(content) {
   content.settings.navHoverColor ||= '#00C9A7';
   content.settings.logo ||= ''; // legado V4/V6.2
   content.settings.headerLogo ||= content.settings.logo || '';
+  content.settings.headerLogoLight ||= content.settings.headerLogo || content.settings.logo || '';
+  content.settings.headerLogoDark ||= content.settings.headerLogo || content.settings.logo || '';
   content.settings.heroLogo ||= content.settings.logo || '';
+  content.settings.introVideoEnabled = content.settings.introVideoEnabled === true || String(content.settings.introVideoEnabled).toLowerCase() === 'true' || String(content.settings.introVideoEnabled) === '1';
+  content.settings.introVideoTitle ||= 'Conheça a Yuran Multicerviços';
+  content.settings.introVideoText ||= 'Veja como a plataforma aproxima profissionais e clientes, como funciona a verificação e quais recursos estão disponíveis.';
+  content.settings.introVideoUrl ||= '';
   content.settings.address ||= content.settings.location || '';
   content.settings.favicon ||= '';
   content.settings.heroBackgroundImage ||= '';
@@ -329,7 +400,7 @@ async function writeData(content) {
 const imageUpload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 8 * 1024 * 1024, files: 16 },
-  fileFilter: (_, file, cb) => cb(null, file.mimetype.startsWith('image/'))
+  fileFilter: (_, file, cb) => cb(null, ['image/jpeg','image/png','image/webp'].includes(file.mimetype))
 });
 const cvUpload = multer({
   storage: multer.memoryStorage(), limits: { fileSize: 12 * 1024 * 1024 },
@@ -338,18 +409,21 @@ const cvUpload = multer({
 const identityUpload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 10 * 1024 * 1024, files: 2 },
-  fileFilter: (_, file, cb) => cb(null, file.mimetype.startsWith('image/') || file.mimetype === 'application/pdf')
+  fileFilter: (_, file, cb) => cb(null, ['image/jpeg','image/png','image/webp','application/pdf'].includes(file.mimetype))
 });
 function safeName(name) { return name.replace(/[^a-zA-Z0-9._-]/g, '-'); }
 
 async function saveUpload(file, folder) {
   if (!file) return '';
-  if (folder === 'images' && !isValidImageBuffer(file)) throw new Error('Imagem inválida. Use JPG, PNG ou WebP.');
-  if (folder === 'cvs' && !isValidPdfBuffer(file)) throw new Error('PDF inválido.');
-  const filename = `${Date.now()}-${crypto.randomBytes(4).toString('hex')}-${safeName(file.originalname)}`;
+  const detected = detectedUploadType(file);
+  if (folder === 'images' && detected?.kind !== 'image') throw new Error('Imagem inválida. Use JPG, PNG ou WebP.');
+  if (folder === 'cvs' && detected?.kind !== 'pdf') throw new Error('PDF inválido.');
+  if (!detected) throw new Error('Tipo de ficheiro não permitido.');
+  // Nunca use a extensão/nome enviados pelo navegador: o tipo real é derivado da assinatura binária.
+  const filename = `${Date.now()}-${crypto.randomBytes(8).toString('hex')}${detected.ext}`;
   if (USE_SUPABASE) {
     const storagePath = `${folder}/${filename}`;
-    const { error } = await supabase.storage.from(STORAGE_BUCKET).upload(storagePath, file.buffer, { contentType: file.mimetype, upsert: false });
+    const { error } = await supabase.storage.from(STORAGE_BUCKET).upload(storagePath, file.buffer, { contentType: detected.mime, upsert: false });
     if (error) throw error;
     return supabase.storage.from(STORAGE_BUCKET).getPublicUrl(storagePath).data.publicUrl;
   }
@@ -374,10 +448,10 @@ async function deleteUpload(url) {
 
 async function savePrivateIdentityUpload(file, profileId, side) {
   if (!file || !USE_SUPABASE) throw new Error('Documentos de identificação requerem Supabase.');
-  if (!(isValidImageBuffer(file) || isValidPdfBuffer(file))) throw new Error('Documento inválido. Use JPG, PNG, WebP ou PDF.');
-  const ext = path.extname(file.originalname || '').replace(/[^.a-zA-Z0-9]/g, '') || (file.mimetype === 'application/pdf' ? '.pdf' : '.jpg');
-  const storagePath = `professionals/${profileId}/${side}-${Date.now()}-${crypto.randomBytes(5).toString('hex')}${ext}`;
-  const { error } = await supabase.storage.from(VERIFICATION_BUCKET).upload(storagePath, file.buffer, { contentType: file.mimetype, upsert: false });
+  const detected = detectedUploadType(file);
+  if (!detected || !['image','pdf'].includes(detected.kind)) throw new Error('Documento inválido. Use JPG, PNG, WebP ou PDF.');
+  const storagePath = `professionals/${profileId}/${side}-${Date.now()}-${crypto.randomBytes(8).toString('hex')}${detected.ext}`;
+  const { error } = await supabase.storage.from(VERIFICATION_BUCKET).upload(storagePath, file.buffer, { contentType: detected.mime, upsert: false });
   if (error) throw error;
   return storagePath;
 }
@@ -458,17 +532,33 @@ app.get('/api/admin/session', (req, res) => res.json({ authenticated: !!req.sess
 app.put('/api/admin/settings', requireAuth, async (req, res) => {
   try {
     const data = await readData();
-    data.settings = { ...data.settings, ...req.body };
+    const body = { ...req.body };
+    const textFields = ['siteName','tagline','seoTitle','seoDescription','heroTitle','heroText','whatsapp','phone','email','address','about','introVideoTitle','introVideoText','introVideoUrl'];
+    for (const key of textFields) if (body[key] !== undefined) body[key] = String(body[key]).trim().slice(0, key === 'about' || key === 'introVideoText' ? 6000 : 500);
+    if (body.heroOverlay !== undefined) body.heroOverlay = String(Math.max(0, Math.min(.8, Number(body.heroOverlay) || 0)));
+    if (body.introVideoEnabled !== undefined) body.introVideoEnabled = ['on','true','1','yes'].includes(String(body.introVideoEnabled).toLowerCase());
+    data.settings = { ...data.settings, ...body };
     await writeData(data); res.json(data.settings);
   } catch (error) { console.error(error); res.status(500).json({ error: 'Erro ao guardar configurações.' }); }
 });
 
-app.post('/api/admin/settings/assets', requireAuth, imageUpload.fields([{ name: 'headerLogo', maxCount: 1 }, { name: 'heroLogo', maxCount: 1 }, { name: 'logo', maxCount: 1 }, { name: 'favicon', maxCount: 1 }, { name: 'heroBackground', maxCount: 1 }]), async (req, res) => {
+app.post('/api/admin/settings/assets', requireAuth, imageUpload.fields([{ name: 'headerLogoLight', maxCount: 1 }, { name: 'headerLogoDark', maxCount: 1 }, { name: 'headerLogo', maxCount: 1 }, { name: 'heroLogo', maxCount: 1 }, { name: 'logo', maxCount: 1 }, { name: 'favicon', maxCount: 1 }, { name: 'heroBackground', maxCount: 1 }]), async (req, res) => {
   try {
     const data = await readData();
     data.settings ||= {};
+    if (req.files?.headerLogoLight?.[0]) {
+      if (data.settings.headerLogoLight && data.settings.headerLogoLight !== data.settings.headerLogoDark) await deleteUpload(data.settings.headerLogoLight);
+      data.settings.headerLogoLight = await saveUpload(req.files.headerLogoLight[0], 'images');
+    }
+    if (req.files?.headerLogoDark?.[0]) {
+      if (data.settings.headerLogoDark && data.settings.headerLogoDark !== data.settings.headerLogoLight) await deleteUpload(data.settings.headerLogoDark);
+      data.settings.headerLogoDark = await saveUpload(req.files.headerLogoDark[0], 'images');
+    }
     if (req.files?.headerLogo?.[0]) {
-      data.settings.headerLogo = await saveUpload(req.files.headerLogo[0], 'images');
+      const legacyHeader = await saveUpload(req.files.headerLogo[0], 'images');
+      data.settings.headerLogo = legacyHeader;
+      data.settings.headerLogoLight ||= legacyHeader;
+      data.settings.headerLogoDark ||= legacyHeader;
     }
     if (req.files?.heroLogo?.[0]) {
       data.settings.heroLogo = await saveUpload(req.files.heroLogo[0], 'images');
@@ -476,7 +566,7 @@ app.post('/api/admin/settings/assets', requireAuth, imageUpload.fields([{ name: 
     // Compatibilidade com formulários antigos: um logo legado preenche as duas áreas.
     if (req.files?.logo?.[0]) {
       const legacy = await saveUpload(req.files.logo[0], 'images');
-      data.settings.logo = legacy; data.settings.headerLogo = legacy; data.settings.heroLogo = legacy;
+      data.settings.logo = legacy; data.settings.headerLogo = legacy; data.settings.headerLogoLight = legacy; data.settings.headerLogoDark = legacy; data.settings.heroLogo = legacy;
     }
     if (req.files?.favicon?.[0]) {
       if (data.settings.favicon) await deleteUpload(data.settings.favicon);
@@ -561,6 +651,18 @@ app.delete('/api/admin/services/:id', requireAuth, async (req, res) => {
       data[collection] ||= []; data[collection].push(item); await writeData(data); res.json(item);
     } catch (error) { console.error(error); res.status(500).json({ error: 'Erro ao adicionar item.' }); }
   });
+  app.put(`/api/admin/${collection}/:id`, requireAuth, async (req, res) => {
+    try {
+      const data = await readData();
+      const index = (data[collection] || []).findIndex(i => i.id === req.params.id);
+      if (index < 0) return res.status(404).json({ error: 'Item não encontrado.' });
+      const current = data[collection][index];
+      const update = collection === 'socials'
+        ? { ...current, platform: String(req.body.platform ?? current.platform).trim().slice(0,80), url: normalizeUrl(req.body.url ?? current.url), iconClass: String(req.body.iconClass ?? current.iconClass ?? 'bi-link-45deg').trim().slice(0,80) }
+        : { ...current, title: String(req.body.title ?? current.title).trim().slice(0,120), url: normalizeUrl(req.body.url ?? current.url), iconClass: String(req.body.iconClass ?? current.iconClass ?? 'bi-link-45deg').trim().slice(0,80) };
+      data[collection][index] = update; await writeData(data); res.json(update);
+    } catch (error) { console.error(error); res.status(500).json({ error: 'Erro ao atualizar item.' }); }
+  });
   app.delete(`/api/admin/${collection}/:id`, requireAuth, async (req, res) => {
     try { const data = await readData(); data[collection] = (data[collection] || []).filter(i => i.id !== req.params.id); await writeData(data); res.json({ ok: true }); }
     catch (error) { console.error(error); res.status(500).json({ error: 'Erro ao remover item.' }); }
@@ -577,6 +679,17 @@ app.post('/api/admin/partners', requireAuth, imageUpload.fields([{ name: 'logoLi
     const item = { id: uid('partner'), name: req.body.name || 'Parceiro', logo: legacy, logoLight, logoDark, url: normalizeUrl(req.body.url) };
     data.partners.push(item); await writeData(data); res.json(item);
   } catch (error) { console.error(error); res.status(500).json({ error: 'Erro ao adicionar parceiro.' }); }
+});
+app.put('/api/admin/partners/:id', requireAuth, imageUpload.fields([{ name: 'logoLight', maxCount: 1 }, { name: 'logoDark', maxCount: 1 }]), async (req, res) => {
+  try {
+    const data = await readData(); const index = data.partners.findIndex(i => i.id === req.params.id);
+    if (index < 0) return res.status(404).json({ error: 'Parceiro não encontrado.' });
+    const current = data.partners[index]; let logoLight = current.logoLight || current.logo || '', logoDark = current.logoDark || current.logo || '';
+    if (req.files?.logoLight?.[0]) { if (logoLight && logoLight !== logoDark) await deleteUpload(logoLight); logoLight = await saveUpload(req.files.logoLight[0], 'images'); }
+    if (req.files?.logoDark?.[0]) { if (logoDark && logoDark !== logoLight) await deleteUpload(logoDark); logoDark = await saveUpload(req.files.logoDark[0], 'images'); }
+    const updated = { ...current, name: String(req.body.name ?? current.name).trim().slice(0,160), url: normalizeUrl(req.body.url ?? current.url), logoLight, logoDark };
+    data.partners[index] = updated; await writeData(data); res.json(updated);
+  } catch (error) { console.error(error); res.status(500).json({ error: 'Erro ao atualizar parceiro.' }); }
 });
 app.delete('/api/admin/partners/:id', requireAuth, async (req, res) => {
   try {
@@ -595,6 +708,18 @@ app.post('/api/admin/portfolio', requireAuth, imageUpload.array('images', 12), a
     const item = { id: uid('portfolio'), title: req.body.title || 'Projeto', service: req.body.service || '', description: req.body.description || '', link: normalizeUrl(req.body.link || ''), images, image: images[0] || '', featured: req.body.featured === 'on' || req.body.featured === 'true' || req.body.featured === '1' };
     data.portfolio.unshift(item); await writeData(data); res.json(item);
   } catch (error) { console.error(error); res.status(500).json({ error: 'Erro ao publicar projeto.' }); }
+});
+app.put('/api/admin/portfolio/:id', requireAuth, imageUpload.array('images', 12), async (req, res) => {
+  try {
+    const data = await readData(); const index = data.portfolio.findIndex(i => i.id === req.params.id);
+    if (index < 0) return res.status(404).json({ error: 'Projeto não encontrado.' });
+    const current = data.portfolio[index]; let images = current.images?.length ? [...current.images] : (current.image ? [current.image] : []);
+    if (req.body.replaceImages === '1' && (req.files || []).length) { for (const url of images) await deleteUpload(url); images = []; }
+    for (const file of req.files || []) images.push(await saveUpload(file, 'images'));
+    images = images.slice(0,12);
+    const updated = { ...current, title: String(req.body.title ?? current.title).trim().slice(0,180), service: String(req.body.service ?? current.service).trim().slice(0,160), description: String(req.body.description ?? current.description).trim().slice(0,6000), images, image: images[0] || '', featured: req.body.featured === 'on' || req.body.featured === 'true' || req.body.featured === '1' };
+    data.portfolio[index] = updated; await writeData(data); res.json(updated);
+  } catch (error) { console.error(error); res.status(500).json({ error: 'Erro ao atualizar projeto.' }); }
 });
 app.patch('/api/admin/portfolio/:id/featured', requireAuth, async (req, res) => {
   try {
@@ -622,6 +747,16 @@ app.post('/api/admin/team', requireAuth, imageUpload.single('photo'), async (req
     const item = { id: uid('team'), name: req.body.name || 'Profissional', role: req.body.role || '', bio: req.body.bio || '', photo: req.file ? await saveUpload(req.file, 'images') : '', cv: '' };
     data.team.push(item); await writeData(data); res.json(item);
   } catch (error) { console.error(error); res.status(500).json({ error: 'Erro ao adicionar profissional.' }); }
+});
+app.put('/api/admin/team/:id', requireAuth, imageUpload.single('photo'), async (req, res) => {
+  try {
+    const data = await readData(); const index = data.team.findIndex(i => i.id === req.params.id);
+    if (index < 0) return res.status(404).json({ error: 'Membro da equipa não encontrado.' });
+    const current = data.team[index]; let photo = current.photo || '';
+    if (req.file) { if (photo) await deleteUpload(photo); photo = await saveUpload(req.file, 'images'); }
+    const updated = { ...current, name: String(req.body.name ?? current.name).trim().slice(0,160), role: String(req.body.role ?? current.role).trim().slice(0,160), bio: String(req.body.bio ?? current.bio).trim().slice(0,3000), photo };
+    data.team[index] = updated; await writeData(data); res.json(updated);
+  } catch (error) { console.error(error); res.status(500).json({ error: 'Erro ao atualizar membro da equipa.' }); }
 });
 app.post('/api/admin/team/:id/cv', requireAuth, (_, res) => res.status(410).json({ error: 'Currículos agora pertencem aos perfis profissionais cadastrados.' }));
 app.delete('/api/admin/team/:id', requireAuth, async (req, res) => {
@@ -725,7 +860,7 @@ app.post('/api/professional/register', identityUpload.fields([{ name: 'idFront',
     if (profileError) { await supabase.from('professional_users').delete().eq('id', userId); throw profileError; }
     await regenerateSession(req);
     req.session.professionalId = profileId;
-    await notifyProfessional(profileId, 'account', 'Cadastro recebido — perfil e documentação em análise', 'Recebemos o seu cadastro e os documentos de identificação. O seu perfil e a documentação estão agora em análise. Pode completar o perfil enquanto aguarda a validação.', '/profissional/dashboard');
+    await notifyProfessional(profileId, 'account', 'Cadastro recebido — perfil e documentação em análise', 'Recebemos o seu cadastro e os documentos de identificação. O seu perfil e a documentação estão agora em análise. Pode completar o perfil enquanto aguarda a validação.', '/profissional/dashboard', { sendEmail: true });
     res.json({ ok: true, profile: { id: profileId, name, slug, email, status: 'pending', verification_status: 'pending' } });
   } catch (error) {
     console.error(error);
@@ -995,7 +1130,7 @@ app.get('/api/professionals', async (req, res) => {
   try {
     await releaseExpiredSuspensions();
     const [{ data: profiles, error: pe }, { data: services, error: se }, { data: ratings, error: re }] = await Promise.all([
-      supabase.from('professional_profiles').select('id,name,slug,photo,specialty,headline,bio,location,verified,featured,years_experience,service_area,availability,languages,skills,response_time_label,profile_completeness,verification_status,created_at,last_active_at').eq('status', 'approved').order('featured',{ascending:false}).order('created_at', { ascending: false }),
+      supabase.from('professional_profiles').select('id,name,slug,photo,specialty,headline,bio,location,verified,featured,years_experience,service_area,availability,languages,skills,response_time_label,profile_completeness,verification_status,profile_type,institutional_role,official_profile,founder_message,created_at,last_active_at').eq('status', 'approved').order('featured',{ascending:false}).order('created_at', { ascending: false }),
       supabase.from('professional_services').select('id,professional_id,title,category,availability,service_area').eq('status', 'approved').order('created_at', { ascending: false }),
       supabase.from('professional_ratings').select('professional_id,stars,status').eq('status','published')
     ]);
@@ -1025,7 +1160,7 @@ app.get('/api/professionals', async (req, res) => {
 app.get('/api/professionals/:slug', async (req, res) => {
   try {
     await releaseExpiredSuspensions();
-    const { data: profile, error } = await supabase.from('professional_profiles').select('id,name,slug,photo,specialty,headline,bio,location,phone,whatsapp,email,website,linkedin,instagram,cv_url,verified,verification_status,featured,years_experience,service_area,availability,languages,skills,certifications,education,response_time_label,profile_completeness,created_at,last_active_at').eq('slug', req.params.slug).eq('status', 'approved').maybeSingle();
+    const { data: profile, error } = await supabase.from('professional_profiles').select('id,name,slug,photo,specialty,headline,bio,location,phone,whatsapp,email,website,linkedin,instagram,cv_url,verified,verification_status,featured,years_experience,service_area,availability,languages,skills,certifications,education,response_time_label,profile_completeness,profile_type,institutional_role,official_profile,founder_message,created_at,last_active_at').eq('slug', req.params.slug).eq('status', 'approved').maybeSingle();
     if (error) throw error; if (!profile) return res.status(404).json({ error: 'Profissional não encontrado.' });
     const [{ data: services, error: se }, { data: projects, error: pe }, { data: ratings, error: re }, { data: events }] = await Promise.all([
       supabase.from('professional_services').select('id,title,slug,category,description,price,service_area,availability,delivery_time,cover_image').eq('professional_id', profile.id).eq('status', 'approved').order('featured',{ascending:false}).order('created_at', { ascending: false }),
@@ -1138,7 +1273,7 @@ app.patch('/api/admin/moderation/:type/:id', requireAuth, async (req, res) => {
     let professionalId = table === 'professional_profiles' ? data.id : data.professional_id;
     const typeLabel = table === 'professional_profiles' ? 'perfil' : table === 'professional_services' ? 'serviço' : 'projeto';
     const message = status === 'approved' ? (table === 'professional_profiles' ? 'A sua documentação já foi validada e o seu perfil profissional foi aprovado. O perfil pode agora ficar disponível ao público, de acordo com as regras da plataforma.' : `O seu ${typeLabel} foi aprovado.`) : status === 'rejected' ? `O seu ${typeLabel} foi rejeitado. Motivo: ${String(req.body.rejection_reason || 'Consulte o painel.')}` : status === 'suspended' ? `O seu ${typeLabel} foi suspenso pela administração.` : `O seu ${typeLabel} voltou para análise.`;
-    await notifyProfessional(professionalId, 'moderation', `${typeLabel[0].toUpperCase()+typeLabel.slice(1)}: ${status === 'approved' ? 'aprovado' : status === 'rejected' ? 'rejeitado' : status === 'suspended' ? 'suspenso' : 'em análise'}`, message, '/profissional/dashboard');
+    await notifyProfessional(professionalId, 'moderation', table === 'professional_profiles' && status === 'approved' ? 'Conta profissional aprovada — 100%' : `${typeLabel[0].toUpperCase()+typeLabel.slice(1)}: ${status === 'approved' ? 'aprovado' : status === 'rejected' ? 'rejeitado' : status === 'suspended' ? 'suspenso' : 'em análise'}`, table === 'professional_profiles' && status === 'approved' ? 'A sua identidade e o seu perfil profissional foram aprovados. A sua conta está agora totalmente aprovada e pode utilizar as funcionalidades de publicação da plataforma.' : message, '/profissional/dashboard', { sendEmail: table === 'professional_profiles' });
     res.json(data);
   } catch (error) { console.error(error); res.status(500).json({ error: error.message || 'Erro ao moderar item.' }); }
 });
@@ -1174,7 +1309,7 @@ app.patch('/api/admin/professionals/:id/verification', requireAuth, async (req, 
     const { data, error } = await supabase.from('professional_profiles').update(update).eq('id', req.params.id).select('*').single();
     if (error) throw error;
     await safeAuditLog({ target_type: 'identity', target_id: req.params.id, action: status, reason, metadata: { retention_days: IDENTITY_RETENTION_DAYS } });
-    await notifyProfessional(req.params.id, 'identity', status === 'approved' ? 'Identidade validada' : status === 'rejected' ? 'Documento precisa ser reenviado' : 'Identidade em análise', status === 'approved' ? 'A sua documentação de identificação foi aprovada. Continue a completar o perfil; a publicação pública do perfil depende ainda da aprovação administrativa do conteúdo profissional.' : status === 'rejected' ? `A validação do documento foi recusada. Motivo: ${reason}` : 'Os seus documentos estão em análise.', '/profissional/dashboard');
+    await notifyProfessional(req.params.id, 'identity', status === 'approved' ? 'Identidade validada' : status === 'rejected' ? 'Documento precisa ser reenviado' : 'Identidade em análise', status === 'approved' ? 'A sua documentação de identificação foi aprovada. Continue a completar o perfil; a publicação pública do perfil depende ainda da aprovação administrativa do conteúdo profissional.' : status === 'rejected' ? `A validação do documento foi recusada. Motivo: ${reason}` : 'Os seus documentos estão em análise.', '/profissional/dashboard', { sendEmail: true });
     res.json(data);
   } catch (error) { console.error(error); res.status(500).json({ error: error.message || 'Erro ao validar identidade.' }); }
 });
@@ -1215,7 +1350,11 @@ app.put('/api/admin/professionals/:id', requireAuth, async (req, res) => {
       certifications: String(req.body.certifications ?? current.certifications ?? '').trim(),
       education: req.body.education !== undefined ? normalizeEducation(req.body.education) : normalizeEducation(current.education || []),
       years_experience: Math.max(0, Math.min(80, Number(req.body.years_experience ?? current.years_experience ?? 0) || 0)),
-      availability
+      availability,
+      profile_type: ['professional','team','founder','institutional'].includes(String(req.body.profile_type)) ? String(req.body.profile_type) : (current.profile_type || 'professional'),
+      institutional_role: String(req.body.institutional_role ?? current.institutional_role ?? '').trim().slice(0,160),
+      official_profile: ['on','true','1','yes'].includes(String(req.body.official_profile ?? current.official_profile ?? false).toLowerCase()),
+      founder_message: String(req.body.founder_message ?? current.founder_message ?? '').trim().slice(0,3000)
     };
     const update = {
       name: candidate.name,
@@ -1233,6 +1372,10 @@ app.put('/api/admin/professionals/:id', requireAuth, async (req, res) => {
       education: candidate.education,
       years_experience: candidate.years_experience,
       availability: candidate.availability,
+      profile_type: candidate.profile_type,
+      institutional_role: candidate.institutional_role,
+      official_profile: candidate.official_profile,
+      founder_message: candidate.founder_message,
       profile_completeness: profileCompleteness(candidate),
       updated_at: new Date().toISOString()
     };
@@ -1274,12 +1417,14 @@ app.get('/api/admin/email-center', requireAuth, async (req, res) => {
       supabase.from('admin_email_logs').select('*').order('created_at', { ascending: false }).limit(50)
     ]);
     if (pe) throw pe;
-    res.json({ configured: Boolean(RESEND_API_KEY && EMAIL_FROM), from: EMAIL_FROM || '', professionals: professionals || [], logs: le ? [] : (logs || []) });
+    const emailConfig = emailConfigState();
+    res.json({ configured: emailConfig.configured, from: emailConfig.from || '', testMode: emailConfig.testMode, warning: emailConfig.warning || '', professionals: professionals || [], logs: le ? [] : (logs || []) });
   } catch (error) { console.error(error); res.status(500).json({ error: 'Erro ao carregar centro de comunicação.' }); }
 });
 app.post('/api/admin/emails/send', requireAuth, async (req, res) => {
   try {
-    if (!RESEND_API_KEY || !EMAIL_FROM) return res.status(503).json({ error: 'O envio de e-mail ainda não está configurado. Adicione RESEND_API_KEY e EMAIL_FROM no Render.' });
+    const emailConfig = emailConfigState();
+    if (!emailConfig.configured) return res.status(503).json({ error: emailConfig.warning || 'O envio de e-mail ainda não está configurado.' });
     const audience = String(req.body.audience || 'individual');
     const professionalId = String(req.body.professional_id || '');
     const subject = String(req.body.subject || '').trim().slice(0, 160);
@@ -1292,16 +1437,16 @@ app.post('/api/admin/emails/send', requireAuth, async (req, res) => {
     } else if (audience !== 'all') return res.status(400).json({ error: 'Público inválido.' });
     const { data: recipients, error } = await q.order('name', { ascending: true }); if (error) throw error;
     if (!recipients?.length) return res.status(404).json({ error: 'Nenhum destinatário encontrado.' });
-    let sent = 0, failed = 0;
+    let sent = 0, failed = 0, errors = [];
     for (let i = 0; i < recipients.length; i += 5) {
       const batch = recipients.slice(i, i + 5);
-      const results = await Promise.all(batch.map(p => notifyProfessional(p.id, 'admin_message', subject, message, '/profissional/dashboard')));
-      for (const r of results) r.emailSent ? sent++ : failed++;
+      const results = await Promise.all(batch.map(p => notifyProfessional(p.id, 'admin_message', subject, message, '/profissional/dashboard', { sendEmail: true })));
+      for (const r of results) { if (r.emailSent) sent++; else { failed++; if (r.emailError && errors.length < 3) errors.push(r.emailError); } }
       if (i + 5 < recipients.length) await new Promise(resolve => setTimeout(resolve, 350));
     }
     try { await supabase.from('admin_email_logs').insert({ id: crypto.randomUUID(), audience, professional_id: audience === 'individual' ? professionalId : null, subject, recipient_count: recipients.length, sent_count: sent, failed_count: failed, created_at: new Date().toISOString() }); } catch {}
     await safeAuditLog({ target_type: 'communication', target_id: audience === 'individual' ? professionalId : 'all', action: 'email_sent', reason: subject, metadata: { recipient_count: recipients.length, sent, failed } });
-    res.json({ ok: true, recipients: recipients.length, sent, failed });
+    res.json({ ok: true, recipients: recipients.length, sent, failed, errors });
   } catch (error) { console.error(error); res.status(500).json({ error: error.message || 'Erro ao enviar e-mails.' }); }
 });
 
@@ -1337,14 +1482,14 @@ app.post('/api/admin/reports/:id/action', requireAuth, async (req, res) => {
       await supabase.from('professional_profiles').update({ warning_count: Number(profile.warning_count || 0) + 1, last_warning: message, updated_at: new Date().toISOString() }).eq('id', profile.id);
       await supabase.from('professional_reports').update({ status: 'actioned', admin_action: 'warn', reviewed_at: new Date().toISOString() }).eq('id', report.id);
       await safeAuditLog({ target_type: 'professional', target_id: profile.id, action: 'warning', reason: message, metadata: { report_id: report.id } });
-      await notifyProfessional(profile.id, 'warning', 'Advertência da administração', message, '/profissional/dashboard');
+      await notifyProfessional(profile.id, 'warning', 'Advertência da administração', message, '/profissional/dashboard', { sendEmail: true });
     } else if (action === 'suspend') {
       const days = Math.min(365, Math.max(1, Number(req.body.suspensionDays || 7))), until = new Date(Date.now()+days*86400000).toISOString();
       const previous = profile.status === 'suspended' ? (profile.pre_suspension_status || 'pending') : profile.status;
       await supabase.from('professional_profiles').update({ status: 'suspended', pre_suspension_status: previous, suspended_until: until, suspension_reason: reason || `Suspensão temporária por ${days} dia(s).`, updated_at: new Date().toISOString() }).eq('id', profile.id);
       await supabase.from('professional_reports').update({ status: 'actioned', admin_action: `suspend_${days}d`, reviewed_at: new Date().toISOString() }).eq('id', report.id);
       await safeAuditLog({ target_type: 'professional', target_id: profile.id, action: `suspend_${days}d`, reason: reason || 'Suspensão após denúncia.', metadata: { report_id: report.id, suspended_until: until } });
-      await notifyProfessional(profile.id, 'suspension', 'Conta suspensa temporariamente', reason || `A sua conta foi suspensa por ${days} dia(s).`, '/profissional/dashboard');
+      await notifyProfessional(profile.id, 'suspension', 'Conta suspensa temporariamente', reason || `A sua conta foi suspensa por ${days} dia(s).`, '/profissional/dashboard', { sendEmail: true });
     } else if (action === 'dismiss') {
       await supabase.from('professional_reports').update({ status: 'dismissed', admin_action: 'dismiss', reviewed_at: new Date().toISOString() }).eq('id', report.id);
       await safeAuditLog({ target_type: 'professional', target_id: profile.id, action: 'report_dismissed', reason: reason || 'Denúncia arquivada sem ação disciplinar.', metadata: { report_id: report.id } });
@@ -1413,7 +1558,7 @@ app.get('/api/platform-summary', async (_, res) => {
 
 app.get('/api/featured-professionals', async (_, res) => {
   try {
-    const { data: profiles, error } = await supabase.from('professional_profiles').select('id,name,slug,photo,specialty,headline,location,verified,verification_status,years_experience,availability,profile_completeness').eq('status','approved').eq('featured',true).order('updated_at',{ascending:false}).limit(8);
+    const { data: profiles, error } = await supabase.from('professional_profiles').select('id,name,slug,photo,specialty,headline,location,verified,verification_status,years_experience,availability,profile_completeness,profile_type,institutional_role,official_profile').eq('status','approved').eq('featured',true).order('updated_at',{ascending:false}).limit(8);
     if (error) throw error;
     const ids=(profiles||[]).map(x=>x.id);
     let ratings=[];
@@ -1424,7 +1569,7 @@ app.get('/api/featured-professionals', async (_, res) => {
 
 app.get('/api/professionals/:slug/services/:serviceSlug', async (req,res)=>{
   try{
-    const {data:profile,error:pe}=await supabase.from('professional_profiles').select('id,name,slug,photo,specialty,headline,location,whatsapp,phone,email,verified,verification_status,years_experience,service_area,availability,response_time_label,created_at').eq('slug',req.params.slug).eq('status','approved').maybeSingle();
+    const {data:profile,error:pe}=await supabase.from('professional_profiles').select('id,name,slug,photo,specialty,headline,location,whatsapp,phone,email,verified,verification_status,years_experience,service_area,availability,response_time_label,profile_type,institutional_role,official_profile,created_at').eq('slug',req.params.slug).eq('status','approved').maybeSingle();
     if(pe)throw pe;if(!profile)return res.status(404).json({error:'Profissional não encontrado.'});
     const {data:service,error:se}=await supabase.from('professional_services').select('*').eq('professional_id',profile.id).eq('slug',req.params.serviceSlug).eq('status','approved').maybeSingle();
     if(se)throw se;if(!service)return res.status(404).json({error:'Serviço não encontrado.'});
@@ -1506,5 +1651,5 @@ if (USE_SUPABASE) {
   setInterval(()=>supabase.from('app_sessions').delete().lt('expire',new Date().toISOString()).then(()=>{}).catch(()=>{}),6*60*60*1000).unref();
 }
 
-app.get('/health', (_, res) => res.json({ ok: true, storage: USE_SUPABASE ? 'supabase' : 'local', persistent: USE_SUPABASE, supabaseConfigured: USE_SUPABASE }));
+app.get('/health', (_, res) => res.json({ ok: true, storage: USE_SUPABASE ? 'supabase' : 'local', persistent: USE_SUPABASE, supabaseConfigured: USE_SUPABASE, security: { sessionSecretConfigured: SESSION_SECRET_CONFIGURED, admin2faAvailable: true, secureCookies: IS_PRODUCTION, originGuard: true, uploadSignatureValidation: true } }));
 app.listen(PORT, () => { console.log(`Site disponível na porta ${PORT}`); console.log(`Armazenamento: ${USE_SUPABASE ? 'Supabase (persistente)' : 'local (desenvolvimento)'}`); });
