@@ -1,6 +1,19 @@
-# Yuran Multicerviços — V7.3
+# Yuran Multicerviços V7.4
 
-Versão focada em estabilidade do painel administrativo, perfis institucionais/fundador, vídeo de apresentação leve, identidade visual por tema e reforço de segurança.
+Plataforma Node.js + Express + Supabase com diretório de profissionais, serviços, projetos, moderação, identidade, avaliações, denúncias, notificações, e-mail e painel administrativo.
 
-Antes do deploy, execute `supabase-v7.3.sql` no Supabase.
-Leia `INSTALACAO-V7.3.txt`, `CHANGELOG-V7.3.txt` e `SECURITY-V7.3.md`.
+## Destaques da V7.4
+
+- cadastro profissional mínimo e onboarding por etapas;
+- login Google direto para o painel profissional;
+- dados de validação separados da criação da conta;
+- data de nascimento e número de identificação;
+- envio manual do perfil para a fila de validação;
+- responsividade/mobile reforçada e textos profissionais justificados;
+- Yuran Admin redesenhado;
+- Yuran Multicerviços e Yuran Admin instaláveis como PWAs;
+- mantém hardening de segurança da V7.3/V7.3.1.
+
+Antes do deploy, execute `supabase-v7.4.sql` uma vez no Supabase.
+
+Consulte `INSTALACAO-V7.4.txt` para o passo a passo completo.

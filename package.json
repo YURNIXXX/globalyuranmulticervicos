@@ -1,7 +1,7 @@
 {
   "name": "yuranmultiservicos",
-  "version": "7.3.0",
-  "description": "Yuran Multicerviços V7.3 — plataforma profissional com moderação, perfis oficiais, vídeo institucional e hardening de segurança.",
+  "version": "7.4.0",
+  "description": "Yuran Multicerviços V7.4 — onboarding por etapas, experiência mobile, Yuran Admin moderno e PWAs instaláveis.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

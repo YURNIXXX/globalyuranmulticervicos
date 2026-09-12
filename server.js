@@ -16,6 +16,8 @@ const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'mudar-esta-senha';
 const ADMIN_RECOVERY_KEY = process.env.ADMIN_RECOVERY_KEY || '';
 const SESSION_SECRET_CONFIGURED = Boolean(process.env.SESSION_SECRET);
 const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(48).toString('hex');
+const TOTP_ENCRYPTION_KEY_CONFIGURED = Boolean(process.env.TOTP_ENCRYPTION_KEY);
+const TOTP_ENCRYPTION_KEY = process.env.TOTP_ENCRYPTION_KEY || SESSION_SECRET;
 const SUPABASE_URL = process.env.SUPABASE_URL || '';
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_KEY || '';
@@ -181,7 +183,7 @@ async function validAdminPassword(password) {
   return data._admin?.passwordHash ? verifyPassword(password, data._admin.passwordHash) : String(password) === ADMIN_PASSWORD;
 }
 
-function secretKey() { return crypto.createHash('sha256').update(String(SESSION_SECRET)).digest(); }
+function secretKey() { return crypto.createHash('sha256').update(String(TOTP_ENCRYPTION_KEY)).digest(); }
 function encryptSecret(value = '') {
   const iv = crypto.randomBytes(12), cipher = crypto.createCipheriv('aes-256-gcm', secretKey(), iv);
   const encrypted = Buffer.concat([cipher.update(String(value), 'utf8'), cipher.final()]);
@@ -236,6 +238,18 @@ function profileQualityMissing(p = {}) {
   if (!String(p.photo||'').trim()) missing.push('foto profissional');
   if (!String(p.service_area||'').trim()) missing.push('área de atendimento');
   return missing;
+}
+function validationRequirements(p = {}) {
+  const missing = [];
+  if (!String(p.address||'').trim()) missing.push('endereço');
+  if (!String(p.location||'').trim()) missing.push('cidade / província');
+  if (digits(p.phone).length < 8) missing.push('número do celular');
+  if (digits(p.whatsapp).length < 8) missing.push('número do WhatsApp');
+  if (!String(p.birth_date||'').trim()) missing.push('data de nascimento');
+  if (String(p.id_number||'').trim().length < 4) missing.push('número de identificação');
+  missing.push(...profileQualityMissing(p));
+  if (!String(p.skills||'').trim()) missing.push('competências');
+  return [...new Set(missing)];
 }
 function normalizeEmailFrom(value = '') {
   // Evita um erro comum no Render: colar "EMAIL_FROM = ..." dentro do valor.
@@ -812,7 +826,7 @@ async function getProfessionalSessionProfile(id) {
   return data;
 }
 function canPublish(profile) {
-  return profile && profile.verification_status === 'approved' && !['suspended','rejected'].includes(profile.status);
+  return profile && profile.status === 'approved' && profile.verification_status === 'approved';
 }
 async function recordProfessionalEvent(req, professionalId, eventType, { serviceId = null, channel = '', scopeKey = 'general' } = {}) {
   try {
@@ -822,50 +836,70 @@ async function recordProfessionalEvent(req, professionalId, eventType, { service
   } catch (error) { console.error('Métrica não registada:', error.message); }
 }
 
-app.post('/api/professional/register', identityUpload.fields([{ name: 'idFront', maxCount: 1 }, { name: 'idBack', maxCount: 1 }]), async (req, res) => {
-  let frontPath = '', backPath = '';
+app.post('/api/professional/register', async (req, res) => {
   try {
     if (!USE_SUPABASE) return res.status(503).json({ error: 'O cadastro de profissionais requer Supabase.' });
     const name = String(req.body.name || '').trim();
-    const address = String(req.body.address || '').trim();
-    const location = String(req.body.location || '').trim();
-    const phone = String(req.body.phone || '').trim();
-    const whatsapp = String(req.body.whatsapp || '').trim();
     const email = String(req.body.email || '').trim().toLowerCase();
     const password = String(req.body.password || '');
     const confirmPassword = String(req.body.confirmPassword || '');
-    const legalAccepted = ['on','true','1','yes'].includes(String(req.body.legalAccepted || '').toLowerCase());
-    const front = req.files?.idFront?.[0], back = req.files?.idBack?.[0];
-    const googleIdentity = req.body.googleRegistration === '1' ? req.session.googleIdentity : null;
     if (name.length < 3) return res.status(400).json({ error: 'Informe o nome completo.' });
-    if (!address) return res.status(400).json({ error: 'Informe o endereço.' });
-    if (digits(phone).length < 8) return res.status(400).json({ error: 'Informe um número de celular válido.' });
-    if (digits(whatsapp).length < 8) return res.status(400).json({ error: 'Informe um número de WhatsApp válido.' });
     if (!/^\S+@\S+\.\S+$/.test(email)) return res.status(400).json({ error: 'Informe um e-mail válido.' });
     if (password.length < 8) return res.status(400).json({ error: 'A senha deve ter pelo menos 8 caracteres.' });
     if (password !== confirmPassword) return res.status(400).json({ error: 'As duas senhas não coincidem.' });
-    if (!front || !back) return res.status(400).json({ error: 'Carregue a frente e o verso do documento de identificação.' });
-    if (!legalAccepted) return res.status(400).json({ error: 'É necessário aceitar os Termos de Uso e a Política de Privacidade.' });
-    if (googleIdentity && googleIdentity.email !== email) return res.status(400).json({ error: 'O e-mail deve ser o mesmo da conta Google.' });
+
     const { data: exists, error: existsError } = await supabase.from('professional_users').select('id').eq('email', email).maybeSingle();
     if (existsError) throw existsError;
     if (exists) return res.status(409).json({ error: 'Já existe uma conta com este e-mail.' });
+
     const userId = crypto.randomUUID(), profileId = crypto.randomUUID(), slug = await uniqueProfessionalSlug(name), now = new Date().toISOString();
-    frontPath = await savePrivateIdentityUpload(front, profileId, 'front');
-    backPath = await savePrivateIdentityUpload(back, profileId, 'back');
-    const { error: userError } = await supabase.from('professional_users').insert({ id: userId, email, password_hash: hashPassword(password), google_sub: googleIdentity?.sub || null, auth_provider: googleIdentity ? 'google+password' : 'password', created_at: now, updated_at: now });
+    const { error: userError } = await supabase.from('professional_users').insert({
+      id: userId,
+      email,
+      password_hash: hashPassword(password),
+      auth_provider: 'password',
+      created_at: now,
+      updated_at: now
+    });
     if (userError) throw userError;
-    const seed = { name, specialty: '', bio: '', location, phone, whatsapp, photo: '', service_area: '', skills: '', years_experience: 0, cv_url: '' };
-    const { error: profileError } = await supabase.from('professional_profiles').insert({ id: profileId, user_id: userId, name, slug, email, address, location, phone, whatsapp, status: 'pending', verified: false, verification_status: 'pending', id_front_path: frontPath, id_back_path: backPath, identity_submitted_at: now, terms_accepted_at: now, privacy_accepted_at: now, profile_completeness: profileCompleteness(seed), last_active_at: now, created_at: now, updated_at: now });
-    if (profileError) { await supabase.from('professional_users').delete().eq('id', userId); throw profileError; }
+
+    const seed = { name, specialty: '', bio: '', location: '', phone: '', whatsapp: '', photo: '', service_area: '', skills: '', years_experience: 0, cv_url: '' };
+    const { error: profileError } = await supabase.from('professional_profiles').insert({
+      id: profileId,
+      user_id: userId,
+      name,
+      slug,
+      email,
+      address: '',
+      location: '',
+      phone: '',
+      whatsapp: '',
+      status: 'draft',
+      verified: false,
+      verification_status: 'not_submitted',
+      profile_completeness: profileCompleteness(seed),
+      last_active_at: now,
+      created_at: now,
+      updated_at: now
+    });
+    if (profileError) {
+      await supabase.from('professional_users').delete().eq('id', userId);
+      throw profileError;
+    }
+
     await regenerateSession(req);
     req.session.professionalId = profileId;
-    await notifyProfessional(profileId, 'account', 'Cadastro recebido — perfil e documentação em análise', 'Recebemos o seu cadastro e os documentos de identificação. O seu perfil e a documentação estão agora em análise. Pode completar o perfil enquanto aguarda a validação.', '/profissional/dashboard', { sendEmail: true });
-    res.json({ ok: true, profile: { id: profileId, name, slug, email, status: 'pending', verification_status: 'pending' } });
+    await notifyProfessional(
+      profileId,
+      'account',
+      'Conta profissional criada',
+      'A sua conta foi criada com sucesso. Complete os dados pessoais, o perfil profissional e a verificação de identidade antes de enviar o perfil para análise.',
+      '/profissional/dashboard',
+      { sendEmail: true }
+    );
+    res.json({ ok: true, profile: { id: profileId, name, slug, email, status: 'draft', verification_status: 'not_submitted' } });
   } catch (error) {
     console.error(error);
-    if (frontPath) await deletePrivateIdentityUpload(frontPath);
-    if (backPath) await deletePrivateIdentityUpload(backPath);
     res.status(500).json({ error: error.message || 'Não foi possível criar a conta.' });
   }
 });
@@ -893,30 +927,84 @@ app.post('/api/professional/google-login', async (req, res) => {
     if (!token) return res.status(400).json({ error: 'Token Google ausente.' });
     const { data: authData, error: authError } = await supabase.auth.getUser(token);
     if (authError || !authData?.user?.email) return res.status(401).json({ error: 'Não foi possível validar a conta Google.' });
+
     const googleUser = authData.user, email = googleUser.email.toLowerCase();
     let { data: account, error } = await supabase.from('professional_users').select('*').eq('google_sub', googleUser.id).maybeSingle();
     if (error) throw error;
+
     if (!account) {
       const byEmail = await supabase.from('professional_users').select('*').eq('email', email).maybeSingle();
       if (byEmail.error) throw byEmail.error;
       account = byEmail.data;
-      if (account) await supabase.from('professional_users').update({ google_sub: googleUser.id, auth_provider: 'google+password', updated_at: new Date().toISOString() }).eq('id', account.id);
+      if (account) {
+        await supabase.from('professional_users').update({
+          google_sub: googleUser.id,
+          auth_provider: account.auth_provider === 'password' ? 'google+password' : 'google',
+          updated_at: new Date().toISOString()
+        }).eq('id', account.id);
+      }
     }
-    if (account) {
-      const { data: profile, error: pError } = await supabase.from('professional_profiles').select('*').eq('user_id', account.id).maybeSingle();
-      if (pError) throw pError;
-      if (!profile) return res.status(404).json({ error: 'Perfil profissional não encontrado.' });
-      await regenerateSession(req);
-      req.session.professionalId = profile.id;
-      await supabase.from('professional_profiles').update({ last_active_at: new Date().toISOString() }).eq('id', profile.id);
-      return res.json({ ok: true, needsRegistration: false });
+
+    if (!account) {
+      const now = new Date().toISOString();
+      const name = String(googleUser.user_metadata?.full_name || googleUser.user_metadata?.name || email.split('@')[0] || 'Profissional').trim();
+      const userId = crypto.randomUUID(), profileId = crypto.randomUUID(), slug = await uniqueProfessionalSlug(name);
+      const randomPassword = crypto.randomBytes(32).toString('hex');
+      const { error: userError } = await supabase.from('professional_users').insert({
+        id: userId,
+        email,
+        password_hash: hashPassword(randomPassword),
+        google_sub: googleUser.id,
+        auth_provider: 'google',
+        created_at: now,
+        updated_at: now
+      });
+      if (userError) throw userError;
+
+      const seed = { name, specialty: '', bio: '', location: '', phone: '', whatsapp: '', photo: '', service_area: '', skills: '', years_experience: 0, cv_url: '' };
+      const { error: profileError } = await supabase.from('professional_profiles').insert({
+        id: profileId,
+        user_id: userId,
+        name,
+        slug,
+        email,
+        status: 'draft',
+        verified: false,
+        verification_status: 'not_submitted',
+        profile_completeness: profileCompleteness(seed),
+        last_active_at: now,
+        created_at: now,
+        updated_at: now
+      });
+      if (profileError) {
+        await supabase.from('professional_users').delete().eq('id', userId);
+        throw profileError;
+      }
+      account = { id: userId };
+      await notifyProfessional(
+        profileId,
+        'account',
+        'Conta profissional criada com Google',
+        'A sua conta foi criada com sucesso. Complete os dados obrigatórios e envie o perfil para validação quando estiver pronto.',
+        '/profissional/dashboard',
+        { sendEmail: true }
+      );
     }
-    const googleIdentity = { sub: googleUser.id, email, name: googleUser.user_metadata?.full_name || googleUser.user_metadata?.name || '' };
+
+    const { data: profile, error: pError } = await supabase.from('professional_profiles').select('*').eq('user_id', account.id).maybeSingle();
+    if (pError) throw pError;
+    if (!profile) return res.status(404).json({ error: 'Perfil profissional não encontrado.' });
+
     await regenerateSession(req);
-    req.session.googleIdentity = googleIdentity;
-    res.json({ ok: true, needsRegistration: true, googleProfile: { email, name: googleIdentity.name } });
-  } catch (error) { console.error(error); res.status(500).json({ error: 'Erro ao entrar com Google.' }); }
+    req.session.professionalId = profile.id;
+    await supabase.from('professional_profiles').update({ last_active_at: new Date().toISOString() }).eq('id', profile.id);
+    return res.json({ ok: true, needsRegistration: false, created: profile.status === 'draft' });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Erro ao entrar com Google.' });
+  }
 });
+
 app.get('/api/professional/google-pending', (req, res) => res.json({ googleProfile: req.session.googleIdentity ? { email: req.session.googleIdentity.email, name: req.session.googleIdentity.name } : null }));
 
 app.post('/api/professional/logout', requireProfessional, (req, res) => req.session.destroy(() => res.json({ ok: true })));
@@ -936,8 +1024,13 @@ app.post('/api/professional/change-password', requireProfessional, async (req, r
     const profile = await getProfessionalSessionProfile(req.session.professionalId);
     const { data: user, error } = await supabase.from('professional_users').select('*').eq('id', profile.user_id).single();
     if (error) throw error;
-    if (!verifyPassword(currentPassword, user.password_hash)) return res.status(401).json({ error: 'A senha atual está incorreta.' });
-    const { error: updateError } = await supabase.from('professional_users').update({ password_hash: hashPassword(newPassword), updated_at: new Date().toISOString() }).eq('id', user.id);
+    const googleOnly = user.auth_provider === 'google';
+    if (!googleOnly && !verifyPassword(currentPassword, user.password_hash)) return res.status(401).json({ error: 'A senha atual está incorreta.' });
+    const { error: updateError } = await supabase.from('professional_users').update({
+      password_hash: hashPassword(newPassword),
+      auth_provider: googleOnly ? 'google+password' : user.auth_provider,
+      updated_at: new Date().toISOString()
+    }).eq('id', user.id);
     if (updateError) throw updateError;
     res.json({ ok: true });
   } catch (error) { console.error(error); res.status(500).json({ error: 'Erro ao alterar a senha.' }); }
@@ -997,7 +1090,23 @@ app.get('/api/professional/dashboard', requireProfessional, async (req, res) => 
     const uniqueContacts = new Set((events||[]).filter(x=>x.event_type==='contact').map(x=>x.visitor_hash)).size;
     const completion = profileCompleteness(profile);
     if (completion !== Number(profile.profile_completeness||0)) await supabase.from('professional_profiles').update({ profile_completeness: completion }).eq('id', profile.id);
-    res.json({ profile: professionalSessionRow({ ...profile, profile_completeness: completion }), services: services || [], projects: projects || [], notifications: notifications || [], reviews: reviews || [], metrics: { views: uniqueViews, contacts: uniqueContacts, ratingAvg, ratingCount: ratings?.length || 0, unreadNotifications: (notifications||[]).filter(n=>!n.read_at).length } });
+    const validationMissing = validationRequirements(profile);
+    res.json({
+      profile: professionalSessionRow({ ...profile, profile_completeness: completion }),
+      services: services || [],
+      projects: projects || [],
+      notifications: notifications || [],
+      reviews: reviews || [],
+      onboarding: {
+        accountCreated: true,
+        personalComplete: validationMissing.every(x => !['endereço','cidade / província','número do celular','número do WhatsApp','data de nascimento','número de identificação'].includes(x)),
+        professionalComplete: validationMissing.every(x => !['especialidade','apresentação profissional com pelo menos 80 caracteres','localização','foto profissional','área de atendimento','competências'].includes(x)),
+        identitySubmitted: Boolean(profile.identity_submitted_at && profile.verification_status !== 'not_submitted'),
+        validationSubmitted: profile.status !== 'draft',
+        missing: validationMissing
+      },
+      metrics: { views: uniqueViews, contacts: uniqueContacts, ratingAvg, ratingCount: ratings?.length || 0, unreadNotifications: (notifications||[]).filter(n=>!n.read_at).length }
+    });
   } catch (error) { console.error(error); res.status(500).json({ error: 'Erro ao carregar o painel.' }); }
 });
 
@@ -1006,13 +1115,15 @@ app.put('/api/professional/profile', requireProfessional, imageUpload.fields([{ 
     const current = await getProfessionalSessionProfile(req.session.professionalId);
     if (!current) return res.status(404).json({ error: 'Perfil não encontrado.' });
     const phone = String(req.body.phone || '').trim(), whatsapp = String(req.body.whatsapp || '').trim(), address = String(req.body.address || '').trim();
-    if (digits(phone).length < 8 || digits(whatsapp).length < 8 || !address) return res.status(400).json({ error: 'Endereço, celular e WhatsApp são obrigatórios.' });
     let photo = current.photo || '';
     if (req.files?.photo?.[0]) { if (photo) await deleteUpload(photo); photo = await saveUpload(req.files.photo[0], 'images'); }
     const name = String(req.body.name || current.name).trim();
     const candidate = {
       ...current, name, specialty: String(req.body.specialty || '').trim(), headline: String(req.body.headline || '').trim().slice(0,120), bio: String(req.body.bio || '').trim(), address,
-      location: String(req.body.location || '').trim(), phone, whatsapp, website: normalizeUrl(req.body.website || ''), linkedin: normalizeUrl(req.body.linkedin || ''), instagram: normalizeUrl(req.body.instagram || ''), photo,
+      location: String(req.body.location || '').trim(), phone, whatsapp,
+      birth_date: String(req.body.birth_date || '').trim() || null,
+      id_number: String(req.body.id_number || '').trim().slice(0,120),
+      website: normalizeUrl(req.body.website || ''), linkedin: normalizeUrl(req.body.linkedin || ''), instagram: normalizeUrl(req.body.instagram || ''), photo,
       years_experience: Math.max(0, Math.min(80, Number(req.body.years_experience || 0))), service_area: String(req.body.service_area || '').trim(), availability: ['available','limited','unavailable'].includes(String(req.body.availability)) ? String(req.body.availability) : 'available',
       languages: String(req.body.languages || '').trim().slice(0,500), skills: String(req.body.skills || '').trim().slice(0,1000), certifications: String(req.body.certifications || '').trim().slice(0,1500), education: normalizeEducation(req.body.education), response_time_label: String(req.body.response_time_label || '').trim().slice(0,100)
     };
@@ -1023,6 +1134,68 @@ app.put('/api/professional/profile', requireProfessional, imageUpload.fields([{ 
     if (current.status === 'approved') await notifyProfessional(current.id, 'moderation', 'Alterações enviadas para revisão', 'As alterações do seu perfil foram guardadas e precisam de nova aprovação antes de o perfil voltar a ficar público.', '/profissional/dashboard');
     res.json(professionalSessionRow(data));
   } catch (error) { console.error(error); res.status(500).json({ error: error.message || 'Erro ao guardar o perfil.' }); }
+});
+
+
+app.post('/api/professional/submit-validation', requireProfessional, identityUpload.fields([{ name: 'idFront', maxCount: 1 }, { name: 'idBack', maxCount: 1 }]), async (req, res) => {
+  let frontPath = '', backPath = '';
+  try {
+    const current = await getProfessionalSessionProfile(req.session.professionalId);
+    if (!current) return res.status(404).json({ error: 'Perfil não encontrado.' });
+    if (current.status === 'suspended') return res.status(403).json({ error: 'A conta está suspensa e não pode ser enviada para validação.' });
+
+    const legalAccepted = ['on','true','1','yes'].includes(String(req.body.legalAccepted || '').toLowerCase());
+    const front = req.files?.idFront?.[0], back = req.files?.idBack?.[0];
+    const identityAlreadyApproved = current.verification_status === 'approved';
+    if (!identityAlreadyApproved && (!front || !back)) return res.status(400).json({ error: 'Carregue a frente e o verso do documento de identificação.' });
+
+    const missing = validationRequirements(current);
+    if (missing.length) return res.status(400).json({ error: `Complete os dados obrigatórios antes de enviar para validação: ${missing.join(', ')}.` });
+    if (!current.terms_accepted_at && !legalAccepted) return res.status(400).json({ error: 'Aceite os Termos de Uso e a Política de Privacidade antes de enviar o perfil.' });
+
+    if (!identityAlreadyApproved) {
+      frontPath = await savePrivateIdentityUpload(front, current.id, 'front');
+      backPath = await savePrivateIdentityUpload(back, current.id, 'back');
+      if (current.id_front_path) await deletePrivateIdentityUpload(current.id_front_path);
+      if (current.id_back_path) await deletePrivateIdentityUpload(current.id_back_path);
+    }
+
+    const now = new Date().toISOString();
+    const update = {
+      verification_status: identityAlreadyApproved ? 'approved' : 'pending',
+      verification_reason: '',
+      status: 'pending',
+      verified: identityAlreadyApproved ? Boolean(current.verified) : false,
+      identity_submitted_at: identityAlreadyApproved ? current.identity_submitted_at : now,
+      validation_submitted_at: now,
+      updated_at: now
+    };
+    if (!identityAlreadyApproved) {
+      update.id_front_path = frontPath;
+      update.id_back_path = backPath;
+    }
+    if (!current.terms_accepted_at && legalAccepted) {
+      update.terms_accepted_at = now;
+      update.privacy_accepted_at = now;
+    }
+
+    const { data, error } = await supabase.from('professional_profiles').update(update).eq('id', current.id).select('*').single();
+    if (error) throw error;
+    await notifyProfessional(
+      current.id,
+      'identity',
+      'Perfil e documentação enviados para análise',
+      'Recebemos os seus dados obrigatórios e os documentos de identificação. A administração irá analisar a identidade e o perfil profissional antes da publicação.',
+      '/profissional/dashboard',
+      { sendEmail: true }
+    );
+    res.json(professionalSessionRow(data));
+  } catch (error) {
+    console.error(error);
+    if (frontPath) await deletePrivateIdentityUpload(frontPath).catch(()=>{});
+    if (backPath) await deletePrivateIdentityUpload(backPath).catch(()=>{});
+    res.status(500).json({ error: error.message || 'Erro ao enviar o perfil para validação.' });
+  }
 });
 
 app.post('/api/professional/profile/cv', requireProfessional, cvUpload.single('cv'), async (req, res) => {
@@ -1045,7 +1218,8 @@ app.post('/api/professional/identity', requireProfessional, identityUpload.field
     const backPath = await savePrivateIdentityUpload(back, current.id, 'back');
     if (current.id_front_path) await deletePrivateIdentityUpload(current.id_front_path);
     if (current.id_back_path) await deletePrivateIdentityUpload(current.id_back_path);
-    const { data, error } = await supabase.from('professional_profiles').update({ id_front_path: frontPath, id_back_path: backPath, verification_status: 'pending', verification_reason: '', verified: false, identity_submitted_at: new Date().toISOString(), updated_at: new Date().toISOString() }).eq('id', current.id).select('*').single();
+    const now = new Date().toISOString();
+    const { data, error } = await supabase.from('professional_profiles').update({ id_front_path: frontPath, id_back_path: backPath, verification_status: 'pending', verification_reason: '', verified: false, status: current.status === 'approved' ? 'approved' : 'pending', identity_submitted_at: now, validation_submitted_at: current.validation_submitted_at || now, updated_at: now }).eq('id', current.id).select('*').single();
     if (error) throw error; res.json(professionalSessionRow(data));
   } catch (error) { console.error(error); res.status(500).json({ error: 'Erro ao reenviar documentos.' }); }
 });
@@ -1245,7 +1419,7 @@ app.get('/api/admin/moderation', requireAuth, async (req, res) => {
   try {
     await releaseExpiredSuspensions();
     const [{ data: professionals, error: pe }, { data: services, error: se }, { data: projects, error: pre }] = await Promise.all([
-      supabase.from('professional_profiles').select('*').order('created_at', { ascending: false }),
+      supabase.from('professional_profiles').select('*').neq('status', 'draft').order('created_at', { ascending: false }),
       supabase.from('professional_services').select('*, professional_profiles(name,slug)').order('created_at', { ascending: false }),
       supabase.from('professional_projects').select('*, professional_profiles(name,slug)').order('created_at', { ascending: false })
     ]); if (pe) throw pe; if (se) throw se; if (pre) throw pre;
@@ -1341,9 +1515,12 @@ app.put('/api/admin/professionals/:id', requireAuth, async (req, res) => {
       specialty: String(req.body.specialty ?? current.specialty ?? '').trim(),
       headline: String(req.body.headline ?? current.headline ?? '').trim().slice(0,120),
       bio: String(req.body.bio ?? current.bio ?? '').trim(),
+      address: String(req.body.address ?? current.address ?? '').trim(),
       location: String(req.body.location ?? current.location ?? '').trim(),
       phone: String(req.body.phone ?? current.phone ?? '').trim(),
       whatsapp: String(req.body.whatsapp ?? current.whatsapp ?? '').trim(),
+      birth_date: String(req.body.birth_date ?? current.birth_date ?? '').trim() || null,
+      id_number: String(req.body.id_number ?? current.id_number ?? '').trim().slice(0,120),
       service_area: String(req.body.service_area ?? current.service_area ?? '').trim(),
       skills: String(req.body.skills ?? current.skills ?? '').trim(),
       languages: String(req.body.languages ?? current.languages ?? '').trim(),
@@ -1362,9 +1539,12 @@ app.put('/api/admin/professionals/:id', requireAuth, async (req, res) => {
       specialty: candidate.specialty,
       headline: candidate.headline,
       bio: candidate.bio,
+      address: candidate.address,
       location: candidate.location,
       phone: candidate.phone,
       whatsapp: candidate.whatsapp,
+      birth_date: candidate.birth_date,
+      id_number: candidate.id_number,
       service_area: candidate.service_area,
       skills: candidate.skills,
       languages: candidate.languages,
@@ -1624,7 +1804,9 @@ app.get('/api/admin/analytics/summary', requireAuth, async(_,res)=>{
 
 app.get('/api/admin/2fa/status', requireAuth, async(_,res)=>{try{const d=await readData();res.json({enabled:!!d._admin?.totpEnabled})}catch(e){res.status(500).json({error:'Erro ao verificar 2FA.'})}});
 app.post('/api/admin/2fa/setup', requireAuth, async(req,res)=>{
-  try{const d=await readData();const secret=authenticator.generateSecret();d._admin||={};d._admin.totpPendingEncrypted=encryptSecret(secret);await writeData(d);const label=encodeURIComponent('Yuran Multicerviços Admin');const issuer=encodeURIComponent('Yuran Multicerviços');res.json({secret,otpauthUrl:`otpauth://totp/${label}?secret=${secret}&issuer=${issuer}`})}catch(error){console.error(error);res.status(500).json({error:'Erro ao preparar 2FA.'})}
+  try{
+    if (IS_PRODUCTION && !TOTP_ENCRYPTION_KEY_CONFIGURED) return res.status(503).json({error:'Configure TOTP_ENCRYPTION_KEY no Render antes de ativar a autenticação em dois fatores.'});
+    const d=await readData();const secret=authenticator.generateSecret();d._admin||={};d._admin.totpPendingEncrypted=encryptSecret(secret);await writeData(d);const label=encodeURIComponent('Yuran Multicerviços Admin');const issuer=encodeURIComponent('Yuran Multicerviços');res.json({secret,otpauthUrl:`otpauth://totp/${label}?secret=${secret}&issuer=${issuer}`})}catch(error){console.error(error);res.status(500).json({error:'Erro ao preparar 2FA.'})}
 });
 app.post('/api/admin/2fa/enable', requireAuth, async(req,res)=>{
   try{const d=await readData();const secret=decryptSecret(d._admin?.totpPendingEncrypted||'');const token=String(req.body.token||'').replace(/\s/g,'');if(!secret||!authenticator.check(token,secret))return res.status(400).json({error:'Código inválido. Confirme o código do autenticador.'});d._admin.totpSecretEncrypted=encryptSecret(secret);d._admin.totpEnabled=true;delete d._admin.totpPendingEncrypted;await writeData(d);res.json({ok:true})}catch(error){console.error(error);res.status(500).json({error:'Erro ao ativar 2FA.'})}
@@ -1651,5 +1833,5 @@ if (USE_SUPABASE) {
   setInterval(()=>supabase.from('app_sessions').delete().lt('expire',new Date().toISOString()).then(()=>{}).catch(()=>{}),6*60*60*1000).unref();
 }
 
-app.get('/health', (_, res) => res.json({ ok: true, storage: USE_SUPABASE ? 'supabase' : 'local', persistent: USE_SUPABASE, supabaseConfigured: USE_SUPABASE, security: { sessionSecretConfigured: SESSION_SECRET_CONFIGURED, admin2faAvailable: true, secureCookies: IS_PRODUCTION, originGuard: true, uploadSignatureValidation: true } }));
+app.get('/health', (_, res) => res.json({ ok: true, storage: USE_SUPABASE ? 'supabase' : 'local', persistent: USE_SUPABASE, supabaseConfigured: USE_SUPABASE, security: { sessionSecretConfigured: SESSION_SECRET_CONFIGURED, totpEncryptionKeyConfigured: TOTP_ENCRYPTION_KEY_CONFIGURED, admin2faAvailable: true, secureCookies: IS_PRODUCTION, originGuard: true, uploadSignatureValidation: true } }));
 app.listen(PORT, () => { console.log(`Site disponível na porta ${PORT}`); console.log(`Armazenamento: ${USE_SUPABASE ? 'Supabase (persistente)' : 'local (desenvolvimento)'}`); });

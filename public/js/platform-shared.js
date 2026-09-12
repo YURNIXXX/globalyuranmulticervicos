@@ -24,6 +24,10 @@
   const menu=$('#menuToggle'),nav=$('#nav');if(menu&&nav)menu.onclick=()=>nav.classList.toggle('open');$$('#nav a').forEach(a=>a.onclick=()=>nav?.classList.remove('open'));
   const year=$('#sharedYear');if(year)year.textContent=new Date().getFullYear();
   if(!document.querySelector('link[rel="manifest"]')){const m=document.createElement('link');m.rel='manifest';m.href='/manifest.webmanifest';document.head.appendChild(m)}
+  let deferredInstallPrompt=null;
+  const ensureInstallButton=()=>{let btn=$('#installAppBtn');if(btn)return btn;const actions=$('.header-actions');if(!actions)return null;btn=document.createElement('button');btn.type='button';btn.id='installAppBtn';btn.className='icon-btn install-app-btn';btn.hidden=true;btn.title='Instalar Yuran Multicerviços';btn.setAttribute('aria-label','Instalar Yuran Multicerviços');btn.innerHTML='<i class="bi bi-download"></i><span>Instalar</span>';actions.prepend(btn);btn.onclick=async()=>{if(!deferredInstallPrompt)return;deferredInstallPrompt.prompt();await deferredInstallPrompt.userChoice.catch(()=>{});deferredInstallPrompt=null;btn.hidden=true};return btn};
+  window.addEventListener('beforeinstallprompt',e=>{e.preventDefault();deferredInstallPrompt=e;const btn=ensureInstallButton();if(btn)btn.hidden=false});
+  window.addEventListener('appinstalled',()=>{deferredInstallPrompt=null;const btn=$('#installAppBtn');if(btn)btn.hidden=true});
   if('serviceWorker'in navigator)window.addEventListener('load',()=>navigator.serviceWorker.register('/sw.js',{updateViaCache:'none'}).then(r=>r.update()).catch(()=>{}));
   applyBrand();
 })();

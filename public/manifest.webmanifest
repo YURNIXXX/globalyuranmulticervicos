@@ -1,12 +1,23 @@
 {
   "name": "Yuran Multicerviços",
   "short_name": "Yuran",
-  "description": "Plataforma para encontrar profissionais, serviços e projetos.",
-  "start_url": "/",
+  "description": "Encontre profissionais, serviços e projetos na Yuran Multicerviços.",
+  "id": "/",
+  "start_url": "/?source=pwa",
   "scope": "/",
   "display": "standalone",
-  "background_color": "#0b0f0d",
-  "theme_color": "#0b0f0d",
+  "display_override": ["window-controls-overlay", "standalone"],
+  "orientation": "any",
+  "background_color": "#f5f7f5",
+  "theme_color": "#00c9a7",
   "lang": "pt",
-  "categories": ["business", "productivity", "lifestyle"]
+  "categories": ["business", "productivity", "lifestyle"],
+  "icons": [
+    {"src":"/icons/yuran-192.png","sizes":"192x192","type":"image/png","purpose":"any maskable"},
+    {"src":"/icons/yuran-512.png","sizes":"512x512","type":"image/png","purpose":"any maskable"}
+  ],
+  "shortcuts": [
+    {"name":"Encontrar profissionais","short_name":"Profissionais","url":"/profissionais","icons":[{"src":"/icons/yuran-192.png","sizes":"192x192","type":"image/png"}]},
+    {"name":"Área profissional","short_name":"Minha área","url":"/profissional","icons":[{"src":"/icons/yuran-192.png","sizes":"192x192","type":"image/png"}]}
+  ]
 }

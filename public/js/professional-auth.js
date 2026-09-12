@@ -4,7 +4,7 @@ function switchTab(tab){document.querySelectorAll('[data-auth-tab]').forEach(x=>
 document.querySelectorAll('[data-auth-tab]').forEach(b=>b.onclick=()=>switchTab(b.dataset.authTab));
 $('#showRecovery').onclick=()=>{$('#loginForm').classList.add('hidden');$('#registerForm').classList.add('hidden');$('#recoveryForm').classList.remove('hidden');document.querySelectorAll('[data-auth-tab]').forEach(x=>x.classList.remove('active'))};$('#backLogin').onclick=()=>switchTab('login');
 $('#loginForm').onsubmit=async e=>{e.preventDefault();const m=$('#loginMsg');m.textContent='A entrar...';try{await api('/api/professional/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(Object.fromEntries(new FormData(e.currentTarget)))});location.href='/profissional/dashboard'}catch(x){m.textContent=x.message}};
-$('#registerForm').onsubmit=async e=>{e.preventDefault();const m=$('#registerMsg');m.textContent='A criar conta e enviar documentos...';try{await api('/api/professional/register',{method:'POST',body:new FormData(e.currentTarget)});location.href='/profissional/dashboard'}catch(x){m.textContent=x.message}};
+$('#registerForm').onsubmit=async e=>{e.preventDefault();const form=e.currentTarget,m=$('#registerMsg'),v=Object.fromEntries(new FormData(form));m.textContent='A criar a sua conta...';try{await api('/api/professional/register',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(v)});location.href='/profissional/dashboard'}catch(x){m.textContent=x.message}};
 $('#recoveryForm').onsubmit = async e => {
   e.preventDefault();
 
@@ -35,10 +35,11 @@ $('#recoveryForm').onsubmit = async e => {
       'Não foi possível concluir o pedido neste momento. Tente novamente.';
   }
 };
-async function setupGoogle(){try{const c=await api('/api/public-config');if(!c.googleOAuthAvailable){$('#googleLogin').disabled=true;$('#googleLogin').title='Configure SUPABASE_ANON_KEY e Google no Supabase para ativar.';return}const sb=window.supabase.createClient(c.supabaseUrl,c.supabaseAnonKey);$('#googleLogin').onclick=async()=>{const {error}=await sb.auth.signInWithOAuth({provider:'google',options:{redirectTo:location.origin+'/profissional/google-callback'}});if(error)$('#loginMsg').textContent=error.message}}catch(e){$('#googleLogin').disabled=true}}
-async function completeGoogle(){if(!new URLSearchParams(location.search).has('google'))return false;try{const x=await api('/api/professional/google-pending');if(!x.googleProfile)return false;switchTab('register');$('#googleRegistration').value='1';const f=$('#registerForm');f.elements.name.value=x.googleProfile.name||'';f.elements.email.value=x.googleProfile.email||'';f.elements.email.readOnly=true;$('#registerMsg').textContent='Conta Google validada. Complete os dados e envie o documento de identificação.';return true}catch{return false}}
+async function setupGoogle(){try{const c=await api('/api/public-config');const buttons=['#googleLogin','#googleRegister'].map(s=>$(s)).filter(Boolean);if(!c.googleOAuthAvailable){buttons.forEach(btn=>{btn.disabled=true;btn.title='Configure SUPABASE_ANON_KEY e Google no Supabase para ativar.'});return}const sb=window.supabase.createClient(c.supabaseUrl,c.supabaseAnonKey);const startGoogle=async()=>{const {error}=await sb.auth.signInWithOAuth({provider:'google',options:{redirectTo:location.origin+'/profissional/google-callback'}});if(error){const target=$('#registerForm').classList.contains('hidden')?$('#loginMsg'):$('#registerMsg');target.textContent=error.message}};buttons.forEach(btn=>btn.onclick=startGoogle)}catch(e){['#googleLogin','#googleRegister'].forEach(s=>{const btn=$(s);if(btn)btn.disabled=true})}}
+async function completeGoogle(){return false}
 bindPasswordToggles();
-Promise.all([setupGoogle(),completeGoogle()]).finally(()=>fetch('/api/professional/session').then(r=>r.json()).then(x=>{if(x.authenticated&&!new URLSearchParams(location.search).has('google'))location.href='/profissional/dashboard'}).catch(()=>{}));
+const entryParams=new URLSearchParams(location.search);if(entryParams.get('tab')==='register')switchTab('register');
+Promise.all([setupGoogle(),completeGoogle()]).finally(()=>fetch('/api/professional/session').then(r=>r.json()).then(x=>{if(x.authenticated)location.href='/profissional/dashboard'}).catch(()=>{}));
 
 const resetToken=new URLSearchParams(location.search).get('reset');
 if(resetToken&&$('#resetPasswordForm')){
